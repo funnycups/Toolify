@@ -968,7 +968,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
             )
             tool_calls.append({
                 "index": i, "id": tool_call_id, "type": "function",
-                "function": { "name": tool["name"], "arguments": "" }
+                "function": { "name": tool["name"], "arguments": json.dumps(tool["args"]) }
             })
         return tool_calls
 
@@ -983,14 +983,6 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
         }
         chunks.append(f"data: {json.dumps(initial_chunk)}\n\n")
 
-        for i, tool in enumerate(parsed_tools):
-            args_str = json.dumps(tool["args"])
-            args_chunk = {
-                "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
-                "created": int(os.path.getmtime(__file__)), "model": model_id,
-                "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "function": {"arguments": args_str}}]}, "finish_reason": None}],
-            }
-            chunks.append(f"data: {json.dumps(args_chunk)}\n\n")
 
         final_chunk = {
              "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
