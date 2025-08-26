@@ -365,13 +365,82 @@ def generate_function_prompt(tools: List[Tool], trigger_signal: str) -> tuple[st
         name = func.name
         description = func.description or ""
 
-        props = func.parameters.get("properties", {})
-        params = ", ".join([f"{p_name} ({p_info.get('type')})" for p_name, p_info in props.items()]) or "None"
+        # Robustly read JSON Schema fields
+        schema: Dict[str, Any] = func.parameters or {}
+        props: Dict[str, Any] = schema.get("properties", {}) or {}
+        required_list: List[str] = schema.get("required", []) or []
+
+        # Brief summary line: name (type)
+        params_summary = ", ".join([
+            f"{p_name} ({(p_info or {}).get('type', 'any')})" for p_name, p_info in props.items()
+        ]) or "None"
+
+        # Build detailed parameter spec for prompt injection (default enabled)
+        detail_lines: List[str] = []
+        for p_name, p_info in props.items():
+            p_info = p_info or {}
+            p_type = p_info.get("type", "any")
+            is_required = "Yes" if p_name in required_list else "No"
+            p_desc = p_info.get("description")
+            enum_vals = p_info.get("enum")
+            default_val = p_info.get("default")
+            examples_val = p_info.get("examples") or p_info.get("example")
+
+            # Common constraints and hints
+            constraints: Dict[str, Any] = {}
+            for key in [
+                "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+                "minLength", "maxLength", "pattern", "format",
+                "minItems", "maxItems", "uniqueItems"
+            ]:
+                if key in p_info:
+                    constraints[key] = p_info.get(key)
+
+            # Array item type hint
+            if p_type == "array":
+                items = p_info.get("items") or {}
+                if isinstance(items, dict):
+                    itype = items.get("type")
+                    if itype:
+                        constraints["items.type"] = itype
+
+            # Compose pretty lines
+            detail_lines.append(f"- {p_name}:")
+            detail_lines.append(f"  - type: {p_type}")
+            detail_lines.append(f"  - required: {is_required}")
+            if p_desc:
+                detail_lines.append(f"  - description: {p_desc}")
+            if enum_vals is not None:
+                try:
+                    detail_lines.append(f"  - enum: {json.dumps(enum_vals, ensure_ascii=False)}")
+                except Exception:
+                    detail_lines.append(f"  - enum: {enum_vals}")
+            if default_val is not None:
+                try:
+                    detail_lines.append(f"  - default: {json.dumps(default_val, ensure_ascii=False)}")
+                except Exception:
+                    detail_lines.append(f"  - default: {default_val}")
+            if examples_val is not None:
+                try:
+                    detail_lines.append(f"  - examples: {json.dumps(examples_val, ensure_ascii=False)}")
+                except Exception:
+                    detail_lines.append(f"  - examples: {examples_val}")
+            if constraints:
+                try:
+                    detail_lines.append(f"  - constraints: {json.dumps(constraints, ensure_ascii=False)}")
+                except Exception:
+                    detail_lines.append(f"  - constraints: {constraints}")
+
+        detail_block = "\n".join(detail_lines) if detail_lines else "(no parameter details)"
 
         desc_block = f"```\n{description}\n```" if description else "None"
 
         tools_list_str.append(
-            f"{i + 1}. <tool name=\"{name}\">\n   Description:\n{desc_block}\n   Parameters: {params}"
+            f"{i + 1}. <tool name=\"{name}\">\n"
+            f"   Description:\n{desc_block}\n"
+            f"   Parameters summary: {params_summary}\n"
+            f"   Required parameters: {', '.join(required_list) if required_list else 'None'}\n"
+            f"   Parameter details:\n{detail_block}"
         )
     
     prompt_template = get_function_call_prompt_template(trigger_signal)
