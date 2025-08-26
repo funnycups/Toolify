@@ -269,44 +269,44 @@ No leading or trailing spaces, output exactly as shown above.
 
 3. For multiple tool calls, include multiple <function_call> blocks within the same <function_calls> wrapper.
 
-CORRECT Examples:
+STRICT ARGUMENT KEY RULES:
+- You MUST use parameter keys EXACTLY as defined (case- and punctuation-sensitive). Do NOT rename, add, or remove characters.
+- If a key starts with a hyphen (e.g., -i, -C), you MUST keep the hyphen in the tag name. Example: <-i>true</-i>, <-C>2</-C>.
+- Never convert "-i" to "i" or "-C" to "C". Do not pluralize, translate, or alias parameter keys.
 
-Single tool call:
+CORRECT Example (multiple tool calls, including hyphenated keys):
 ...response content (optional)...
 {trigger_signal}
 <function_calls>
-  <function_call>
-    <tool>tool_name</tool>
-    <args>
-      <key>value</key>
-    </args>
-  </function_call>
-</function_calls>
+    <function_call>
+        <tool>Grep</tool>
+        <args>
+            <-i>true</-i>
+            <-C>2</-C>
+            <path>.</path>
+        </args>
+    </function_call>
+    <function_call>
+        <tool>search</tool>
+        <args>
+            <keywords>["Python Document", "how to use python"]</keywords>
+        </args>
+    </function_call>
+  </function_calls>
 
-Multiple tool calls:
-...response content (optional)...
-{trigger_signal}
-<function_calls>
-  <function_call>
-    <tool>first_tool</tool>
-    <args>
-      <param1>value1</param1>
-    </args>
-  </function_call>
-  <function_call>
-    <tool>second_tool</tool>
-    <args>
-      <param2>value2</param2>
-    </args>
-  </function_call>
-</function_calls>
-
-INCORRECT Example (contains extra text):
+INCORRECT Example (extra text + wrong key names — DO NOT DO THIS):
 ...response content (optional)...
 {trigger_signal}
 I will call the tools for you.
 <function_calls>
-  ...
+    <function_call>
+        <tool>Grep</tool>
+        <args>
+            <i>true</i>
+            <C>2</C>
+            <path>.</path>
+        </args>
+    </function_call>
 </function_calls>
 
 Now please be ready to strictly follow the above specifications.
@@ -364,12 +364,14 @@ def generate_function_prompt(tools: List[Tool], trigger_signal: str) -> tuple[st
         func = tool.function
         name = func.name
         description = func.description or ""
-        
+
         props = func.parameters.get("properties", {})
         params = ", ".join([f"{p_name} ({p_info.get('type')})" for p_name, p_info in props.items()]) or "None"
-        
+
+        desc_block = f"```\n{description}\n```" if description else "None"
+
         tools_list_str.append(
-            f'{i + 1}. <tool name="{name}" description="{description}">\n   Parameters: {params}'
+            f"{i + 1}. <tool name=\"{name}\">\n   Description:\n{desc_block}\n   Parameters: {params}"
         )
     
     prompt_template = get_function_call_prompt_template(trigger_signal)
@@ -566,8 +568,35 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
         args_block_match = re.search(r"<args>([\s\S]*?)</args>", block)
         if args_block_match:
             args_content = args_block_match.group(1)
-            arg_matches = re.findall(r"<(\w+)>([\s\S]*?)</\1>", args_content)
-            args = dict(arg_matches)
+            # Support arg tag names containing hyphens (e.g., -i, -A); match any non-space, non-'>' and non-'/' chars
+            arg_matches = re.findall(r"<([^\s>/]+)>([\s\S]*?)</\1>", args_content)
+
+            def _coerce_value(v: str):
+                t = v.strip()
+                if t.lower() == "true":
+                    return True
+                if t.lower() == "false":
+                    return False
+                # int
+                if re.fullmatch(r"-?\d+", t or ""):
+                    try:
+                        return int(t)
+                    except Exception:
+                        pass
+                # float
+                if re.fullmatch(r"-?\d+\.\d+", t or ""):
+                    try:
+                        return float(t)
+                    except Exception:
+                        pass
+                # try json (arrays/objects)
+                try:
+                    return json.loads(t)
+                except Exception:
+                    return v
+
+            for k, v in arg_matches:
+                args[k] = _coerce_value(v)
         
         result = {"name": name, "args": args}
         results.append(result)
@@ -927,6 +956,51 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
 
     detector = StreamingFunctionCallDetector(trigger_signal)
 
+    def _prepare_tool_calls(parsed_tools: List[Dict[str, Any]]):
+        tool_calls = []
+        for i, tool in enumerate(parsed_tools):
+            tool_call_id = f"call_{uuid.uuid4().hex}"
+            store_tool_call_mapping(
+                tool_call_id,
+                tool["name"],
+                tool["args"],
+                f"Calling tool {tool['name']}"
+            )
+            tool_calls.append({
+                "index": i, "id": tool_call_id, "type": "function",
+                "function": { "name": tool["name"], "arguments": "" }
+            })
+        return tool_calls
+
+    def _build_tool_call_sse_chunks(parsed_tools: List[Dict[str, Any]], model_id: str) -> List[str]:
+        tool_calls = _prepare_tool_calls(parsed_tools)
+        chunks: List[str] = []
+
+        initial_chunk = {
+            "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
+            "created": int(os.path.getmtime(__file__)), "model": model_id,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": None, "tool_calls": tool_calls}, "finish_reason": None}],
+        }
+        chunks.append(f"data: {json.dumps(initial_chunk)}\n\n")
+
+        for i, tool in enumerate(parsed_tools):
+            args_str = json.dumps(tool["args"])
+            args_chunk = {
+                "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
+                "created": int(os.path.getmtime(__file__)), "model": model_id,
+                "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "function": {"arguments": args_str}}]}, "finish_reason": None}],
+            }
+            chunks.append(f"data: {json.dumps(args_chunk)}\n\n")
+
+        final_chunk = {
+             "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
+            "created": int(os.path.getmtime(__file__)), "model": model_id,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        }
+        chunks.append(f"data: {json.dumps(final_chunk)}\n\n")
+        chunks.append("data: [DONE]\n\n")
+        return chunks
+
     try:
         async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
             if response.status_code != 200:
@@ -959,6 +1033,22 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                 chunk_json = json.loads(line_data)
                                 delta_content = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "") or ""
                                 detector.content_buffer += delta_content
+                                # Early termination: once </function_calls> appears, parse and finish immediately
+                                if "</function_calls>" in detector.content_buffer:
+                                    print("🔧 [DEBUG] Detected </function_calls> in stream, finalizing early...")
+                                    parsed_tools = detector.finalize()
+                                    if parsed_tools:
+                                        print(f"🔧 [DEBUG] Early finalize: parsed {len(parsed_tools)} tool calls")
+                                        for sse in _build_tool_call_sse_chunks(parsed_tools, model):
+                                            yield sse
+                                        return
+                                    else:
+                                        print("❌ [ERROR] Early finalize failed to parse tool calls")
+                                        error_content = "Error: Detected tool use signal but failed to parse function call format"
+                                        error_chunk = { "id": "error-chunk", "choices": [{"delta": {"content": error_content}}]}
+                                        yield f"data: {json.dumps(error_chunk)}\n\n"
+                                        yield "data: [DONE]\n\n"
+                                        return
                             except (json.JSONDecodeError, IndexError):
                                 pass
                     continue
@@ -1007,42 +1097,9 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
         parsed_tools = detector.finalize()
         if parsed_tools:
             print(f"🔧 [DEBUG] Streaming processing: Successfully parsed {len(parsed_tools)} tool calls")
-            tool_calls = []
-            for i, tool in enumerate(parsed_tools):
-                tool_call_id = f"call_{uuid.uuid4().hex}"
-                store_tool_call_mapping(
-                    tool_call_id,
-                    tool["name"],
-                    tool["args"],
-                    f"Calling tool {tool['name']}"
-                )
-                tool_calls.append({
-                    "index": i, "id": tool_call_id, "type": "function",
-                    "function": { "name": tool["name"], "arguments": "" }
-                })
-            
-            initial_chunk = {
-                "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
-                "created": int(os.path.getmtime(__file__)), "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": None, "tool_calls": tool_calls}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(initial_chunk)}\n\n"
-
-            for i, tool in enumerate(parsed_tools):
-                args_str = json.dumps(tool["args"])
-                args_chunk = {
-                    "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
-                    "created": int(os.path.getmtime(__file__)), "model": model,
-                    "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "function": {"arguments": args_str}}]}, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(args_chunk)}\n\n"
-
-            final_chunk = {
-                 "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
-                "created": int(os.path.getmtime(__file__)), "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-            }
-            yield f"data: {json.dumps(final_chunk)}\n\n"
+            for sse in _build_tool_call_sse_chunks(parsed_tools, model):
+                yield sse
+            return
         else:
             print(f"❌ [ERROR] Detected tool call signal but XML parsing failed, buffer content: {detector.content_buffer}")
             error_content = "Error: Detected tool use signal but failed to parse function call format"
