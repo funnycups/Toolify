@@ -44,7 +44,7 @@ client_authentication:
 # Feature configuration
 features:
   enable_function_calling: true  # Enable function calling feature
-  enable_logging: true           # Enable logging
+  log_level: "INFO"              # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL, or DISABLED
   convert_developer_to_system: true  # Whether to convert the developer role to the system role
   # prompt_template: |             # [Optional] Custom function calling prompt template. If not set, the default template will be used.
   #   You have a list of tools:
@@ -78,7 +78,15 @@ features:
 # 3. Client authentication:
 #    - allowed_keys: List of client API keys allowed to access this middleware
 #
-# 4. Security reminders:
+# 4. Logging levels:
+#    - DEBUG: Show all debug information (most verbose)
+#    - INFO: Show general information, warnings and errors
+#    - WARNING: Show only warnings and errors
+#    - ERROR: Show only errors
+#    - CRITICAL: Show only critical errors
+#    - DISABLED: Disable all logging
+#
+# 5. Security reminders:
 #    - Please keep API keys safe and do not commit configuration files containing real keys to version control systems
 #    - It is recommended to use different configuration files for different environments
 #    - Environment variables can be used to manage sensitive information

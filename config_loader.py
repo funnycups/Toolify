@@ -78,9 +78,16 @@ class ClientAuthConfig(BaseModel):
 class FeaturesConfig(BaseModel):
     """Feature configuration"""
     enable_function_calling: bool = Field(default=True, description="Enable function calling")
-    enable_logging: bool = Field(default=True, description="Enable logging")
+    log_level: str = Field(default="INFO", description="Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL, or DISABLED")
     convert_developer_to_system: bool = Field(default=True, description="Convert developer role to system role")
     prompt_template: Optional[str] = Field(default=None, description="Custom prompt template for function calling")
+
+    @field_validator('log_level')
+    def validate_log_level(cls, v):
+        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "DISABLED"]
+        if v.upper() not in valid_levels:
+            raise ValueError(f"log_level must be one of {valid_levels}")
+        return v.upper()
 
     @field_validator('prompt_template')
     def validate_prompt_template(cls, v):
@@ -219,15 +226,15 @@ class ConfigLoader:
         """Get set of allowed client keys"""
         return set(self.config.client_authentication.allowed_keys)
     
-    def is_logging_enabled(self) -> bool:
-        """Check if logging is enabled"""
-        return self.config.features.enable_logging
+    def get_log_level(self) -> str:
+        """Get configured log level"""
+        return self.config.features.log_level
     
-    def get_features_config(self) -> Dict[str, bool]:
+    def get_features_config(self) -> Dict[str, Any]:
         """Get feature configuration"""
         return {
             "function_calling": self.config.features.enable_function_calling,
-            "logging": self.config.features.enable_logging,
+            "log_level": self.config.features.log_level,
             "convert_developer_to_system": self.config.features.convert_developer_to_system
         }
 
