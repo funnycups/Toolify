@@ -677,8 +677,26 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
     return results if results else None
 
 def find_upstream(model_name: str) -> tuple[Dict[str, Any], str]:
-    """Find upstream configuration by model name, handling aliases."""
+    """Find upstream configuration by model name, handling aliases and passthrough mode."""
     
+    # Handle model passthrough mode
+    if app_config.features.model_passthrough:
+        logger.info("🔄 Model passthrough mode is active. Forwarding to 'openai' service.")
+        openai_service = None
+        for service in app_config.upstream_services:
+            if service.name == "openai":
+                openai_service = service.model_dump()
+                break
+        
+        if openai_service:
+            if not openai_service.get("api_key"):
+                 raise HTTPException(status_code=500, detail="Configuration error: API key not found for the 'openai' service in model passthrough mode.")
+            # In passthrough mode, the model name from the request is used directly.
+            return openai_service, model_name
+        else:
+            raise HTTPException(status_code=500, detail="Configuration error: 'model_passthrough' is enabled, but no upstream service named 'openai' was found.")
+
+    # Default routing logic
     chosen_model_entry = model_name
     
     if model_name in ALIAS_MAPPING:
@@ -763,6 +781,9 @@ async def general_exception_handler(request: Request, exc: Exception):
 async def verify_api_key(authorization: str = Header(...)):
     """Dependency: verify client API key"""
     client_key = authorization.replace("Bearer ", "")
+    if app_config.features.key_passthrough:
+        # In passthrough mode, skip allowed_keys check
+        return client_key
     if client_key not in ALLOWED_CLIENT_KEYS:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return client_key
@@ -880,7 +901,7 @@ async def chat_completions(
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {upstream['api_key']}",
+        "Authorization": f"Bearer {_api_key}" if app_config.features.key_passthrough else f"Bearer {upstream['api_key']}",
         "Accept": "application/json" if not body.stream else "text/event-stream"
     }
 

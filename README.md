@@ -109,7 +109,10 @@ Refer to [`config.example.yaml`](config.example.yaml) for detailed configuration
 - **`upstream_services`**: List of upstream LLM providers (e.g., Groq, OpenAI, Anthropic).
   - Define `base_url`, `api_key`, supported `models`, and set one service as `is_default: true`.
 - **`client_authentication`**: List of `allowed_keys` for clients accessing this middleware.
-- **`features`**: Toggle features like logging, streaming, and role conversion.
+- **`features`**: Toggle features like logging, role conversion, and API key handling.
+  - `key_passthrough`: Set to `true` to directly forward the client-provided API key to the upstream service, bypassing the configured `api_key` in `upstream_services`.
+  - `model_passthrough`: Set to `true` to forward all requests directly to the upstream service named 'openai', ignoring any model-based routing rules.
+  - `prompt_template`: Customize the system prompt used to instruct the model on how to use tools.
 
 ## Usage
 
