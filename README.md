@@ -63,7 +63,7 @@ You can run Toolify using Python directly or via Docker Compose.
 4. **Run the server:**
 
    ```bash
-   uvicorn main:app --host 0.0.0.0 --port 8000
+   python main.py
    ```
 
 ### Option 2: Using Docker Compose

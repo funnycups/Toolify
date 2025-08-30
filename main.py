@@ -1294,3 +1294,15 @@ def safe_process_tool_choice(tool_choice) -> str:
     except Exception as e:
         logger.error(f"❌ Error processing tool_choice: {e}")
         return ""
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info(f"🚀 Starting server on {app_config.server.host}:{app_config.server.port}")
+    logger.info(f"⏱️  Request timeout: {app_config.server.timeout} seconds")
+    
+    uvicorn.run(
+        app,
+        host=app_config.server.host,
+        port=app_config.server.port,
+        log_level=app_config.features.log_level.lower() if app_config.features.log_level != "DISABLED" else "critical"
+    )

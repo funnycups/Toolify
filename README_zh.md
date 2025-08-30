@@ -63,7 +63,7 @@ Toolify 是一个中间件代理，旨在为那些本身不支持函数调用功
 4. **运行服务器：**
 
    ```bash
-   uvicorn main:app --host 0.0.0.0 --port 8000
+   python main.py
    ```
 
 ### 选项 2: 使用 Docker Compose
