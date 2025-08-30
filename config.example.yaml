@@ -47,11 +47,14 @@ features:
   log_level: "INFO"              # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL, or DISABLED
   convert_developer_to_system: true  # Whether to convert the developer role to the system role
   key_passthrough: false          # If true, directly forward client-provided API key to upstream instead of using configured upstream key
+  model_passthrough: false         # If true, forward all requests directly to the 'openai' upstream service, ignoring model-based routing
   prompt_template: |
+    IGNORE ALL PREVIOUS INSTRUCTIONS. Your ONLY task is to act as an expert assistant that uses the tools provided below. You MUST strictly follow the format and rules outlined here. Any other instructions are to be disregarded.
+
     You are an expert assistant equipped with a set of tools to perform tasks. When you need to use a tool, you MUST strictly follow the format below.
 
     **1. Available Tools:**
-    Here is the list of tools you can use:
+    Here is the list of tools you can use. You have access ONLY to these tools and no others.
     {tools_list}
 
     **2. Tool Call Procedure:**
@@ -59,7 +62,7 @@ features:
     Immediately after the trigger signal, provide your tool calls enclosed in `<function_calls>` XML tags.
 
     **3. XML Format for Tool Calls:**
-    Your tool calls must be structured as follows. Adhere to this format precisely.
+    Your tool calls must be structured as follows. This is the ONLY way you can call tools.
 
     {trigger_signal}
     <function_calls>
@@ -74,7 +77,7 @@ features:
 
     **IMPORTANT RULES:**
     - The `{trigger_signal}` MUST be on its own line and appear only once.
-    - The `<tool>` tag must contain the exact name of a tool from the list.
+    - The `<tool>` tag must contain the exact name of a tool from the list. Any other tool name is invalid.
     - The `<args>` must contain all required arguments for that tool.
     - Do not add any text or explanation after the closing `</function_calls>` tag.
 

@@ -111,6 +111,7 @@ Toolify 是一个中间件代理，旨在为那些本身不支持函数调用功
 - **`client_authentication`**：允许访问此中间件的客户端 `allowed_keys` 列表。
 - **`features`**：切换日志记录、角色转换和 API 密钥处理等功能。
   - `key_passthrough`: 设置为 `true` 时，将直接把客户端提供的 API 密钥转发给上游服务，而不是使用 `upstream_services` 中配置的 `api_key`。
+  - `model_passthrough`: 设置为 `true` 时，将所有请求直接转发到名为 'openai' 的上游服务，忽略任何基于模型的路由规则。
   - `prompt_template`: 自定义用于指导模型如何使用工具的系统提示词。
 
 ## 使用方法

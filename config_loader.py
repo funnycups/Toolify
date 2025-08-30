@@ -68,6 +68,7 @@ class FeaturesConfig(BaseModel):
     convert_developer_to_system: bool = Field(default=True, description="Convert developer role to system role")
     prompt_template: Optional[str] = Field(default=None, description="Custom prompt template for function calling")
     key_passthrough: bool = Field(default=False, description="If true, directly forward client-provided API key to upstream instead of using configured upstream key")
+    model_passthrough: bool = Field(default=False, description="If true, forward all requests directly to the 'openai' upstream service, ignoring model-based routing")
 
     @field_validator('log_level')
     def validate_log_level(cls, v):
