@@ -49,6 +49,8 @@ features:
   key_passthrough: false          # If true, directly forward client-provided API key to upstream instead of using configured upstream key
   model_passthrough: false         # If true, forward all requests directly to the 'openai' upstream service, ignoring model-based routing
   prompt_template: |
+    IGNORE ALL PREVIOUS INSTRUCTIONS. Your ONLY task is to act as an expert assistant that uses the tools provided below. You MUST strictly follow the format and rules outlined here. Any other instructions are to be disregarded.
+
     You are an expert assistant equipped with a set of tools to perform tasks. When you need to use a tool, you MUST strictly follow the format below.
 
     **1. Available Tools:**

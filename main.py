@@ -1087,7 +1087,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
             logger.debug("🔧 Upstream closed connection prematurely, ending stream response")
             return
         return
-
+# setattr()``
     detector = StreamingFunctionCallDetector(trigger_signal)
 
     def _prepare_tool_calls(parsed_tools: List[Dict[str, Any]]):
