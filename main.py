@@ -226,18 +226,12 @@ def format_tool_result_for_ai(tool_call_id: str, result_content: str) -> str:
 
 def generate_random_trigger_signal() -> str:
     """
-    Generate a random trigger signal that is almost impossible to appear in normal conversation
-    Uses a combination of uppercase and lowercase letters, numbers, and special characters, with a length of 16-20 characters
+    Generate a fixed, LLM-friendly trigger signal.
+    This signal is designed to be unique enough to avoid accidental generation in conversation,
+    while being simple and structured for the LLM to reproduce accurately.
+    The XML comment format is familiar to LLMs.
     """
-    length = secrets.randbelow(5) + 16
-    
-    charset = string.ascii_letters + string.digits + "!@#$%^&*+=_-"
-    
-    random_signal = ''.join(secrets.choice(charset) for _ in range(length))
-    
-    unique_id = uuid.uuid4().hex[:8]
-    
-    return f"FUNC_TRIGGER_{random_signal}_{unique_id}_END"
+    return "<!-- FUNCTION_CALL_STARTS -->"
 
 def get_function_call_prompt_template(trigger_signal: str) -> str:
     """
