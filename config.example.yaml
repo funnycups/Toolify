@@ -78,6 +78,7 @@ features:
     - The `<tool>` tag must contain the exact name of a tool from the list. Any other tool name is invalid.
     - The `<args>` must contain all required arguments for that tool.
     - Do not add any text or explanation after the closing `</function_calls>` tag.
+    - If the argument value is a string, do not add quotes around it.
     - When a tool call is necessary, you MUST output the entire and complete structure as defined above. Do not omit any part of it.
 
 # Configuration explanation:
