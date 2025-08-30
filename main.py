@@ -763,6 +763,9 @@ async def general_exception_handler(request: Request, exc: Exception):
 async def verify_api_key(authorization: str = Header(...)):
     """Dependency: verify client API key"""
     client_key = authorization.replace("Bearer ", "")
+    if app_config.features.key_passthrough:
+        # In passthrough mode, skip allowed_keys check
+        return client_key
     if client_key not in ALLOWED_CLIENT_KEYS:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return client_key
@@ -880,7 +883,7 @@ async def chat_completions(
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {upstream['api_key']}",
+        "Authorization": f"Bearer {_api_key}" if app_config.features.key_passthrough else f"Bearer {upstream['api_key']}",
         "Accept": "application/json" if not body.stream else "text/event-stream"
     }
 
