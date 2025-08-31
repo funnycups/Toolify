@@ -669,11 +669,11 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
 
             def _coerce_value(v: str):
                 try:
-                    return json.loads(t)
+                    return json.loads(v)
                 except Exception:
                     pass
                 try:
-                    return eval(t)
+                    return eval(v)
                 except Exception:
                     pass
 
