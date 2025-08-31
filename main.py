@@ -285,21 +285,26 @@ You have access to the following available tools to help solve problems:
 1. You can call MULTIPLE tools in a single response if needed.
 2. The conversation context may already contain tool execution results from previous function calls. Review the conversation history carefully to avoid unnecessary duplicate tool calls.
 3. When tool execution results are present in the context, they will be formatted with XML tags like <tool_result>...</tool_result> for easy identification.
+4. This is the ONLY format you can use for tool calls, and any deviation will result in failure.
 
 When you need to use tools, you **MUST** strictly follow this format. Do NOT include any extra text, explanations, or dialogue on the first and second lines of the tool call syntax:
 
 1. When starting tool calls, begin on a new line with exactly:
 {trigger_signal}
-No leading or trailing spaces, output exactly as shown above.
+No leading or trailing spaces, output exactly as shown above. The trigger signal MUST be on its own line and appear only once.
 
 2. Starting from the second line, **immediately** follow with the complete <function_calls> XML block.
 
 3. For multiple tool calls, include multiple <function_call> blocks within the same <function_calls> wrapper.
 
+4. Do not add any text or explanation after the closing </function_calls> tag.
+
 STRICT ARGUMENT KEY RULES:
 - You MUST use parameter keys EXACTLY as defined (case- and punctuation-sensitive). Do NOT rename, add, or remove characters.
 - If a key starts with a hyphen (e.g., -i, -C), you MUST keep the hyphen in the tag name. Example: <-i>true</-i>, <-C>2</-C>.
 - Never convert "-i" to "i" or "-C" to "C". Do not pluralize, translate, or alias parameter keys.
+- The <tool> tag must contain the exact name of a tool from the list. Any other tool name is invalid.
+- The <args> must contain all required arguments for that tool.
 
 CORRECT Example (multiple tool calls, including hyphenated keys):
 ...response content (optional)...
