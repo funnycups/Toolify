@@ -29,10 +29,8 @@ logger = logging.getLogger(__name__)
 def generate_random_trigger_signal() -> str:
     """Generate a random trigger signal consisting of random string + timestamp + UUID fragment."""
     chars = string.ascii_letters + string.digits
-    random_str = ''.join(secrets.choice(chars) for _ in range(8))
-    timestamp = str(int(time.time() * 1000))[-6:]  # Last 6 digits of timestamp
-    uuid_fragment = uuid.uuid4().hex[:8]
-    return f"TRIGGER_{random_str}_{timestamp}_{uuid_fragment}"
+    random_str = ''.join(secrets.choice(chars) for _ in range(4))
+    return f"<Function_{random_str}_Start>"
 
 try:
     app_config = config_loader.load_config()
