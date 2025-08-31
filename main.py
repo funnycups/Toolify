@@ -672,32 +672,6 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
                     return json.loads(v)
                 except Exception:
                     pass
-                try:
-                    return eval(v)
-                except Exception:
-                    pass
-
-                # t = v.strip()
-                # if t.lower() == "true":
-                #     return True
-                # if t.lower() == "false":
-                #     return False
-                # # int
-                # if re.fullmatch(r"-?\d+", t or ""):
-                #     try:
-                #         return int(t)
-                #     except Exception:
-                #         pass
-                # # float
-                # if re.fullmatch(r"-?\d+\.\d+", t or ""):
-                #     try:
-                #         return float(t)
-                #     except Exception:
-                #         pass
-                # # try json (arrays/objects)
-                # try:
-                #     return json.loads(t)
-                # except Exception:
                 return v
 
             for k, v in arg_matches:
