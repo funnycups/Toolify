@@ -224,7 +224,6 @@ def format_tool_result_for_ai(tool_call_id: str, result_content: str) -> str:
     
     formatted_text = f"""Tool execution result:
 - Tool name: {tool_info['name']}
-- Parameters: {json.dumps(tool_info['args'], ensure_ascii=False, indent=2)}
 - Execution result:
 <tool_result>
 {result_content}
