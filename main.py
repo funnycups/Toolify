@@ -27,10 +27,10 @@ from config_loader import config_loader
 logger = logging.getLogger(__name__)
 
 def generate_random_trigger_signal() -> str:
-    """Generate a random trigger signal consisting of random string + timestamp + UUID fragment."""
+    """Generate a random, self-closing trigger signal like <Function_AB1c_Start/>."""
     chars = string.ascii_letters + string.digits
     random_str = ''.join(secrets.choice(chars) for _ in range(4))
-    return f"<Function_{random_str}_Start>"
+    return f"<Function_{random_str}_Start/>"
 
 try:
     app_config = config_loader.load_config()
