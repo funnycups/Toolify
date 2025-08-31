@@ -26,6 +26,12 @@ from config_loader import config_loader
 
 logger = logging.getLogger(__name__)
 
+def generate_random_trigger_signal() -> str:
+    """Generate a random trigger signal consisting of random string + timestamp + UUID fragment."""
+    chars = string.ascii_letters + string.digits
+    random_str = ''.join(secrets.choice(chars) for _ in range(4))
+    return f"<Function_{random_str}_Start>"
+
 try:
     app_config = config_loader.load_config()
     
@@ -48,6 +54,7 @@ try:
     MODEL_TO_SERVICE_MAPPING, ALIAS_MAPPING = config_loader.get_model_to_service_mapping()
     DEFAULT_SERVICE = config_loader.get_default_service()
     ALLOWED_CLIENT_KEYS = config_loader.get_allowed_client_keys()
+    GLOBAL_TRIGGER_SIGNAL = generate_random_trigger_signal()
     
     logger.info(f"🎯 Configured {len(MODEL_TO_SERVICE_MAPPING)} model mappings")
     if ALIAS_MAPPING:
@@ -215,7 +222,6 @@ def format_tool_result_for_ai(tool_call_id: str, result_content: str) -> str:
     
     formatted_text = f"""Tool execution result:
 - Tool name: {tool_info['name']}
-- Parameters: {json.dumps(tool_info['args'], ensure_ascii=False, indent=2)}
 - Execution result:
 <tool_result>
 {result_content}
@@ -224,20 +230,39 @@ def format_tool_result_for_ai(tool_call_id: str, result_content: str) -> str:
     logger.debug(f"🔧 Formatting completed, tool name: {tool_info['name']}")
     return formatted_text
 
-def generate_random_trigger_signal() -> str:
-    """
-    Generate a random trigger signal that is almost impossible to appear in normal conversation
-    Uses a combination of uppercase and lowercase letters, numbers, and special characters, with a length of 16-20 characters
-    """
-    length = secrets.randbelow(5) + 16
+def format_assistant_tool_calls_for_ai(tool_calls: List[Dict[str, Any]], trigger_signal: str) -> str:
+    """Format assistant tool calls into AI-readable string format."""
+    logger.debug(f"🔧 Formatting assistant tool calls. Count: {len(tool_calls)}")
     
-    charset = string.ascii_letters + string.digits + "!@#$%^&*+=_-"
+    xml_calls_parts = []
+    for tool_call in tool_calls:
+        function_info = tool_call.get("function", {})
+        name = function_info.get("name", "")
+        arguments_json = function_info.get("arguments", "{}")
+        
+        try:
+            # First, try to load as JSON. If it's a string that's a valid JSON, we parse it.
+            args_dict = json.loads(arguments_json)
+        except (json.JSONDecodeError, TypeError):
+            # If it's not a valid JSON string, treat it as a simple string.
+            args_dict = {"raw_arguments": arguments_json}
+
+        args_parts = []
+        for key, value in args_dict.items():
+            # Dump the value back to a JSON string for consistent representation inside XML.
+            json_value = json.dumps(value, ensure_ascii=False)
+            args_parts.append(f"<{key}>{json_value}</{key}>")
+        
+        args_content = "\n".join(args_parts)
+        
+        xml_call = f"<function_call>\n<tool>{name}</tool>\n<args>\n{args_content}\n</args>\n</function_call>"
+        xml_calls_parts.append(xml_call)
+
+    all_calls = "\n".join(xml_calls_parts)
+    final_str = f"{trigger_signal}\n<function_calls>\n{all_calls}\n</function_calls>"
     
-    random_signal = ''.join(secrets.choice(charset) for _ in range(length))
-    
-    unique_id = uuid.uuid4().hex[:8]
-    
-    return f"FUNC_TRIGGER_{random_signal}_{unique_id}_END"
+    logger.debug("🔧 Assistant tool calls formatted successfully.")
+    return final_str
 
 def get_function_call_prompt_template(trigger_signal: str) -> str:
     """
@@ -643,28 +668,11 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
             arg_matches = re.findall(r"<([^\s>/]+)>([\s\S]*?)</\1>", args_content)
 
             def _coerce_value(v: str):
-                t = v.strip()
-                if t.lower() == "true":
-                    return True
-                if t.lower() == "false":
-                    return False
-                # int
-                if re.fullmatch(r"-?\d+", t or ""):
-                    try:
-                        return int(t)
-                    except Exception:
-                        pass
-                # float
-                if re.fullmatch(r"-?\d+\.\d+", t or ""):
-                    try:
-                        return float(t)
-                    except Exception:
-                        pass
-                # try json (arrays/objects)
                 try:
-                    return json.loads(t)
+                    return json.loads(v)
                 except Exception:
-                    return v
+                    pass
+                return v
 
             for k, v in arg_matches:
                 args[k] = _coerce_value(v)
@@ -677,8 +685,26 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
     return results if results else None
 
 def find_upstream(model_name: str) -> tuple[Dict[str, Any], str]:
-    """Find upstream configuration by model name, handling aliases."""
+    """Find upstream configuration by model name, handling aliases and passthrough mode."""
     
+    # Handle model passthrough mode
+    if app_config.features.model_passthrough:
+        logger.info("🔄 Model passthrough mode is active. Forwarding to 'openai' service.")
+        openai_service = None
+        for service in app_config.upstream_services:
+            if service.name == "openai":
+                openai_service = service.model_dump()
+                break
+        
+        if openai_service:
+            if not openai_service.get("api_key"):
+                 raise HTTPException(status_code=500, detail="Configuration error: API key not found for the 'openai' service in model passthrough mode.")
+            # In passthrough mode, the model name from the request is used directly.
+            return openai_service, model_name
+        else:
+            raise HTTPException(status_code=500, detail="Configuration error: 'model_passthrough' is enabled, but no upstream service named 'openai' was found.")
+
+    # Default routing logic
     chosen_model_entry = model_name
     
     if model_name in ALIAS_MAPPING:
@@ -763,6 +789,9 @@ async def general_exception_handler(request: Request, exc: Exception):
 async def verify_api_key(authorization: str = Header(...)):
     """Dependency: verify client API key"""
     client_key = authorization.replace("Bearer ", "")
+    if app_config.features.key_passthrough:
+        # In passthrough mode, skip allowed_keys check
+        return client_key
     if client_key not in ALLOWED_CLIENT_KEYS:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return client_key
@@ -787,6 +816,26 @@ def preprocess_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     logger.debug(f"🔧 Converted tool message to user message: tool_call_id={tool_call_id}")
                 else:
                     logger.debug(f"🔧 Skipped invalid tool message: tool_call_id={tool_call_id}, content={bool(content)}")
+            elif message.get("role") == "assistant" and "tool_calls" in message and message["tool_calls"]:
+                tool_calls = message.get("tool_calls", [])
+                formatted_tool_calls_str = format_assistant_tool_calls_for_ai(tool_calls, GLOBAL_TRIGGER_SIGNAL)
+                
+                # Combine with original content if it exists
+                original_content = message.get("content") or ""
+                final_content = f"{original_content}\n{formatted_tool_calls_str}".strip()
+
+                processed_message = {
+                    "role": "assistant",
+                    "content": final_content
+                }
+                # Copy other potential keys from the original message, except tool_calls
+                for key, value in message.items():
+                    if key not in ["role", "content", "tool_calls"]:
+                        processed_message[key] = value
+
+                processed_messages.append(processed_message)
+                logger.debug(f"🔧 Converted assistant tool_calls to content.")
+
             elif message.get("role") == "developer":
                 if app_config.features.convert_developer_to_system:
                     processed_message = message.copy()
@@ -832,7 +881,6 @@ async def chat_completions(
         is_fc_enabled = app_config.features.enable_function_calling
         has_tools_in_request = bool(body.tools)
         has_function_call = is_fc_enabled and has_tools_in_request
-        trigger_signal = None
         
         logger.debug(f"🔧 Request body constructed, message count: {len(processed_messages)}")
         
@@ -854,10 +902,9 @@ async def chat_completions(
         )
 
     if has_function_call:
-        trigger_signal = generate_random_trigger_signal()
-        logger.debug(f"🔧 Generated trigger signal for this request: {trigger_signal}")
+        logger.debug(f"🔧 Using global trigger signal for this request: {GLOBAL_TRIGGER_SIGNAL}")
         
-        function_prompt, _ = generate_function_prompt(body.tools, trigger_signal)
+        function_prompt, _ = generate_function_prompt(body.tools, GLOBAL_TRIGGER_SIGNAL)
         
         tool_choice_prompt = safe_process_tool_choice(body.tool_choice)
         if tool_choice_prompt:
@@ -880,7 +927,7 @@ async def chat_completions(
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {upstream['api_key']}",
+        "Authorization": f"Bearer {_api_key}" if app_config.features.key_passthrough else f"Bearer {upstream['api_key']}",
         "Accept": "application/json" if not body.stream else "text/event-stream"
     }
 
@@ -901,11 +948,11 @@ async def chat_completions(
             response_json = upstream_response.json()
             logger.debug(f"🔧 Upstream response status code: {upstream_response.status_code}")
             
-            if has_function_call and trigger_signal:
+            if has_function_call:
                 content = response_json["choices"][0]["message"]["content"]
                 logger.debug(f"🔧 Complete response content: {repr(content)}")
                 
-                parsed_tools = parse_function_calls_xml(content, trigger_signal)
+                parsed_tools = parse_function_calls_xml(content, GLOBAL_TRIGGER_SIGNAL)
                 logger.debug(f"🔧 XML parsing result: {parsed_tools}")
                 
                 if parsed_tools:
@@ -1000,11 +1047,11 @@ async def chat_completions(
         
     else:
         return StreamingResponse(
-            stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, trigger_signal),
+            stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, GLOBAL_TRIGGER_SIGNAL),
             media_type="text/event-stream"
         )
 
-async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, model: str, has_fc: bool, trigger_signal: Optional[str] = None):
+async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, model: str, has_fc: bool, trigger_signal: str):
     """
     Enhanced streaming proxy, supports dynamic trigger signals, avoids misjudgment within think tags
     """
@@ -1020,7 +1067,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
             logger.debug("🔧 Upstream closed connection prematurely, ending stream response")
             return
         return
-
+# setattr()``
     detector = StreamingFunctionCallDetector(trigger_signal)
 
     def _prepare_tool_calls(parsed_tools: List[Dict[str, Any]]):

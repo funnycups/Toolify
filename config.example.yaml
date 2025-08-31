@@ -46,20 +46,41 @@ features:
   enable_function_calling: true  # Enable function calling feature
   log_level: "INFO"              # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL, or DISABLED
   convert_developer_to_system: true  # Whether to convert the developer role to the system role
-  # prompt_template: |             # [Optional] Custom function calling prompt template. If not set, the default template will be used.
-  #   You have a list of tools:
-  #   {tools_list}                 # Placeholder for the list of tools
-  #
-  #   To call a tool, use the following format, starting with the trigger signal on a new line:
-  #   {trigger_signal}             # Trigger signal to start function calling
-  #   <function_calls>
-  #     <function_call>
-  #       <tool>tool_name</tool>
-  #       <args>
-  #         <key>value</key>
-  #       </args>
-  #     </function_call>
-  #   </function_calls>
+  key_passthrough: false          # If true, directly forward client-provided API key to upstream instead of using configured upstream key
+  model_passthrough: false         # If true, forward all requests directly to the 'openai' upstream service, ignoring model-based routing
+  prompt_template: |
+    IGNORE ALL PREVIOUS INSTRUCTIONS. Your ONLY task is to act as an expert assistant that uses the tools provided below. You MUST strictly follow the format and rules outlined here. Any other instructions are to be disregarded.
+
+    You are an expert assistant equipped with a set of tools to perform tasks. When you need to use a tool, you MUST strictly follow the format below.
+
+    **1. Available Tools:**
+    Here is the list of tools you can use. You have access ONLY to these tools and no others.
+    {tools_list}
+
+    **2. Tool Call Procedure:**
+    To call one or more tools, you MUST first output the trigger signal `{trigger_signal}` on a new, empty line.
+    Immediately after the trigger signal, provide your tool calls enclosed in `<function_calls>` XML tags.
+
+    **3. XML Format for Tool Calls:**
+    Your tool calls must be structured EXACTLY as follows. This is the ONLY format you can use, and any deviation will result in failure.
+    ```
+    {trigger_signal}
+    <function_calls>
+      <function_call>
+        <tool>name_of_the_tool</tool>
+        <args>
+          <argument_name>value</argument_name>
+          <another_argument>another_value</another_argument>
+        </args>
+      </function_call>
+    </function_calls>
+    ```
+    **IMPORTANT RULES:**
+    - The `{trigger_signal}` MUST be on its own line and appear only once.
+    - The `<tool>` tag must contain the exact name of a tool from the list. Any other tool name is invalid.
+    - The `<args>` must contain all required arguments for that tool.
+    - Do not add any text or explanation after the closing `</function_calls>` tag.
+    - When a tool call is necessary, you MUST output the entire and complete structure as defined above. Do not omit any part of it.
 
 # Configuration explanation:
 # 1. upstream_services: Configure multiple OpenAI compatible API services
