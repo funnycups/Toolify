@@ -29,10 +29,8 @@ logger = logging.getLogger(__name__)
 def generate_random_trigger_signal() -> str:
     """Generate a random trigger signal consisting of random string + timestamp + UUID fragment."""
     chars = string.ascii_letters + string.digits
-    random_str = ''.join(secrets.choice(chars) for _ in range(8))
-    timestamp = str(int(time.time() * 1000))[-6:]  # Last 6 digits of timestamp
-    uuid_fragment = uuid.uuid4().hex[:8]
-    return f"TRIGGER_{random_str}_{timestamp}_{uuid_fragment}"
+    random_str = ''.join(secrets.choice(chars) for _ in range(4))
+    return f"<Function_{random_str}_Start>"
 
 try:
     app_config = config_loader.load_config()
@@ -224,7 +222,6 @@ def format_tool_result_for_ai(tool_call_id: str, result_content: str) -> str:
     
     formatted_text = f"""Tool execution result:
 - Tool name: {tool_info['name']}
-- Parameters: {json.dumps(tool_info['args'], ensure_ascii=False, indent=2)}
 - Execution result:
 <tool_result>
 {result_content}
@@ -671,28 +668,11 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
             arg_matches = re.findall(r"<([^\s>/]+)>([\s\S]*?)</\1>", args_content)
 
             def _coerce_value(v: str):
-                t = v.strip()
-                if t.lower() == "true":
-                    return True
-                if t.lower() == "false":
-                    return False
-                # int
-                if re.fullmatch(r"-?\d+", t or ""):
-                    try:
-                        return int(t)
-                    except Exception:
-                        pass
-                # float
-                if re.fullmatch(r"-?\d+\.\d+", t or ""):
-                    try:
-                        return float(t)
-                    except Exception:
-                        pass
-                # try json (arrays/objects)
                 try:
-                    return json.loads(t)
+                    return json.loads(v)
                 except Exception:
-                    return v
+                    pass
+                return v
 
             for k, v in arg_matches:
                 args[k] = _coerce_value(v)
