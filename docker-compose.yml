@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   toolify:
+    image: toolify
     build:
       context: .
       dockerfile: Dockerfile
