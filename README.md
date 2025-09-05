@@ -40,7 +40,7 @@ You can run Toolify using Python directly or via Docker Compose.
 1. **Clone the repository:**
 
    ```bash
-   git clone https://github.com/yourusername/toolify.git
+   git clone https://github.com/funnycups/toolify.git
    cd toolify
    ```
 
