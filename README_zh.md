@@ -27,9 +27,44 @@ Toolify 是一个中间件代理，旨在为那些本身不支持函数调用功
 
 ## 安装与设置
 
-您可以使用 Python 直接运行 Toolify，也可以通过 Docker Compose 运行。
+您可以通过 Docker Compose 或使用 Python 直接运行 Toolify。
 
-### 选项 1: 使用 Python
+### 选项 1: 使用 Docker Compose
+
+这是推荐的简易部署方式。
+
+#### 前提条件
+
+- 已安装 Docker 和 Docker Compose。
+
+#### 步骤
+
+1. **克隆仓库：**
+
+   ```bash
+   git clone https://github.com/funnycups/toolify.git
+   cd toolify
+   ```
+
+2. **配置应用程序：**
+
+   复制示例配置文件并进行编辑：
+
+   ```bash
+   cp config.example.yaml config.yaml
+   ```
+
+   编辑 `config.yaml`。`docker-compose.yml` 文件已配置为将此文件挂载到容器中。
+
+3. **启动服务：**
+
+   ```bash
+   docker-compose up -d --build
+   ```
+
+   这将构建 Docker 镜像并以后台模式启动 Toolify 服务，可通过 `http://localhost:8000` 访问。
+
+### 选项 2: 使用 Python
 
 #### 前提条件
 
@@ -40,7 +75,7 @@ Toolify 是一个中间件代理，旨在为那些本身不支持函数调用功
 1. **克隆仓库：**
 
    ```bash
-   git clone https://github.com/yourusername/toolify.git
+   git clone https://github.com/funnycups/toolify.git
    cd toolify
    ```
 
@@ -65,41 +100,6 @@ Toolify 是一个中间件代理，旨在为那些本身不支持函数调用功
    ```bash
    python main.py
    ```
-
-### 选项 2: 使用 Docker Compose
-
-这是推荐的简易部署方式。
-
-#### 前提条件
-
-- 已安装 Docker 和 Docker Compose。
-
-#### 步骤
-
-1. **克隆仓库：**
-
-   ```bash
-   git clone https://github.com/yourusername/toolify.git
-   cd toolify
-   ```
-
-2. **配置应用程序：**
-
-   复制示例配置文件并进行编辑：
-
-   ```bash
-   cp config.example.yaml config.yaml
-   ```
-
-   编辑 `config.yaml`。`docker-compose.yml` 文件已配置为将此文件挂载到容器中。
-
-3. **启动服务：**
-
-   ```bash
-   docker-compose up -d --build
-   ```
-
-   这将构建 Docker 镜像并以后台模式启动 Toolify 服务，可通过 `http://localhost:8000` 访问。
 
 ## 配置 (`config.yaml`)
 

@@ -27,9 +27,44 @@ Toolify is a middleware proxy designed to inject OpenAI-compatible function call
 
 ## Installation and Setup
 
-You can run Toolify using Python directly or via Docker Compose.
+You can run Toolify using Docker Compose or Python directly.
 
-### Option 1: Using Python
+### Option 1: Using Docker Compose
+
+This is the recommended way for easy deployment.
+
+#### Prerequisites
+
+- Docker and Docker Compose installed.
+
+#### Steps
+
+1. **Clone the repository:**
+
+   ```bash
+   git clone https://github.com/funnycups/toolify.git
+   cd toolify
+   ```
+
+2. **Configure the application:**
+
+   Copy the example configuration file and edit it:
+
+   ```bash
+   cp config.example.yaml config.yaml
+   ```
+
+   Edit `config.yaml`. The `docker-compose.yml` file is configured to mount this file into the container.
+
+3. **Start the service:**
+
+   ```bash
+   docker-compose up -d --build
+   ```
+
+   This will build the Docker image and start the Toolify service in detached mode, accessible at `http://localhost:8000`.
+
+### Option 2: Using Python
 
 #### Prerequisites
 
@@ -40,7 +75,7 @@ You can run Toolify using Python directly or via Docker Compose.
 1. **Clone the repository:**
 
    ```bash
-   git clone https://github.com/yourusername/toolify.git
+   git clone https://github.com/funnycups/toolify.git
    cd toolify
    ```
 
@@ -65,41 +100,6 @@ You can run Toolify using Python directly or via Docker Compose.
    ```bash
    python main.py
    ```
-
-### Option 2: Using Docker Compose
-
-This is the recommended way for easy deployment.
-
-#### Prerequisites
-
-- Docker and Docker Compose installed.
-
-#### Steps
-
-1. **Clone the repository:**
-
-   ```bash
-   git clone https://github.com/yourusername/toolify.git
-   cd toolify
-   ```
-
-2. **Configure the application:**
-
-   Copy the example configuration file and edit it:
-
-   ```bash
-   cp config.example.yaml config.yaml
-   ```
-
-   Edit `config.yaml`. The `docker-compose.yml` file is configured to mount this file into the container.
-
-3. **Start the service:**
-
-   ```bash
-   docker-compose up -d --build
-   ```
-
-   This will build the Docker image and start the Toolify service in detached mode, accessible at `http://localhost:8000`.
 
 ## Configuration (`config.yaml`)
 
