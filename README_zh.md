@@ -40,7 +40,7 @@ Toolify 是一个中间件代理，旨在为那些本身不支持函数调用功
 1. **克隆仓库：**
 
    ```bash
-   git clone https://github.com/yourusername/toolify.git
+   git clone https://github.com/funnycups/toolify.git
    cd toolify
    ```
 
