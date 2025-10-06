@@ -39,12 +39,13 @@ class UpstreamService(BaseModel):
     
     @field_validator('models')
     def validate_models(cls, v):
-        if not v or len(v) == 0:
-            raise ValueError('models list cannot be empty')
-        for model in v:
-            if not model or model.strip() == "":
-                raise ValueError('model name cannot be empty')
-        return v
+        # Allow empty models list when model_passthrough is enabled
+        # This will be validated at AppConfig level
+        if v:
+            for model in v:
+                if not model or model.strip() == "":
+                    raise ValueError('model name cannot be empty')
+        return v if v else []
 
 
 class ClientAuthConfig(BaseModel):
@@ -93,9 +94,24 @@ class AppConfig(BaseModel):
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     
     @field_validator('upstream_services')
-    def validate_upstream_services(cls, v):
+    def validate_upstream_services(cls, v, info):
         if not v or len(v) == 0:
             raise ValueError('upstream_services cannot be empty')
+        
+        # Get features config to check model_passthrough mode
+        features = info.data.get('features', FeaturesConfig())
+        model_passthrough = features.model_passthrough if hasattr(features, 'model_passthrough') else False
+        
+        # In model_passthrough mode, check for 'openai' service existence
+        if model_passthrough:
+            openai_service = next((s for s in v if s.name == 'openai'), None)
+            if not openai_service:
+                raise ValueError("When model_passthrough is enabled, an upstream service named 'openai' must be configured")
+        else:
+            # In normal mode, validate that services have models
+            for service in v:
+                if not service.models or len(service.models) == 0:
+                    raise ValueError(f"Service '{service.name}' must have at least one model when model_passthrough is disabled")
         
         default_services = [service for service in v if service.is_default]
         if len(default_services) == 0:
