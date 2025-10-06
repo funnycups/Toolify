@@ -21,7 +21,7 @@ class UpstreamService(BaseModel):
     name: str = Field(description="Service name")
     base_url: str = Field(description="Service base URL")
     api_key: str = Field(description="API key")
-    models: List[str] = Field(description="List of supported models")
+    models: List[str] = Field(default_factory=list, description="List of supported models")
     description: str = Field(default="", description="Service description")
     is_default: bool = Field(default=False, description="Is default service")
     
