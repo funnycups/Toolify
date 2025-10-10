@@ -15,6 +15,7 @@ import time
 import random
 import threading
 import logging
+import tiktoken
 from typing import List, Dict, Any, Optional, Literal, Union
 from collections import OrderedDict
 
@@ -25,6 +26,131 @@ from pydantic import BaseModel, ValidationError
 from config_loader import config_loader
 
 logger = logging.getLogger(__name__)
+
+# Token Counter for counting tokens
+class TokenCounter:
+    """Token counter using tiktoken"""
+    
+    # Model prefix to encoding mapping (from tiktoken source)
+    MODEL_PREFIX_TO_ENCODING = {
+        "o1-": "o200k_base",
+        "o3-": "o200k_base",
+        "o4-mini-": "o200k_base",
+        # chat
+        "gpt-5-": "o200k_base",
+        "gpt-4.5-": "o200k_base",
+        "gpt-4.1-": "o200k_base",
+        "chatgpt-4o-": "o200k_base",
+        "gpt-4o-": "o200k_base",
+        "gpt-4-": "cl100k_base",
+        "gpt-3.5-turbo-": "cl100k_base",
+        "gpt-35-turbo-": "cl100k_base",  # Azure deployment name
+        "gpt-oss-": "o200k_harmony",
+        # fine-tuned
+        "ft:gpt-4o": "o200k_base",
+        "ft:gpt-4": "cl100k_base",
+        "ft:gpt-3.5-turbo": "cl100k_base",
+        "ft:davinci-002": "cl100k_base",
+        "ft:babbage-002": "cl100k_base",
+    }
+    
+    def __init__(self):
+        self.encoders = {}
+    
+    def get_encoder(self, model: str):
+        """Get or create encoder for the model"""
+        if model not in self.encoders:
+            encoding = None
+            
+            # First try to get encoding from model name directly
+            try:
+                self.encoders[model] = tiktoken.encoding_for_model(model)
+                return self.encoders[model]
+            except KeyError:
+                pass
+            
+            # Try to find encoding by prefix matching
+            for prefix, enc_name in self.MODEL_PREFIX_TO_ENCODING.items():
+                if model.startswith(prefix):
+                    encoding = enc_name
+                    break
+            
+            # Default to o200k_base for newer models
+            if encoding is None:
+                logger.warning(f"Model {model} not found in prefix mapping, using o200k_base encoding")
+                encoding = "o200k_base"
+            
+            try:
+                self.encoders[model] = tiktoken.get_encoding(encoding)
+            except Exception as e:
+                logger.warning(f"Failed to get encoding {encoding} for model {model}: {e}. Falling back to cl100k_base")
+                self.encoders[model] = tiktoken.get_encoding("cl100k_base")
+                
+        return self.encoders[model]
+    
+    def count_tokens(self, messages: list, model: str = "gpt-3.5-turbo") -> int:
+        """Count tokens in message list"""
+        encoder = self.get_encoder(model)
+        
+        # All modern chat models use similar token counting
+        return self._count_chat_tokens(messages, encoder, model)
+    
+    def _count_chat_tokens(self, messages: list, encoder, model: str) -> int:
+        """Accurate token calculation for chat models
+        
+        Based on OpenAI's token counting documentation:
+        - Each message has a fixed overhead
+        - Content tokens are counted per message
+        - Special tokens for message formatting
+        """
+        # Token overhead varies by model
+        if model.startswith(("gpt-3.5-turbo", "gpt-35-turbo")):
+            # gpt-3.5-turbo uses different message overhead
+            tokens_per_message = 4  # <|start|>role<|separator|>content<|end|>
+            tokens_per_name = -1    # Name is omitted if not present
+        else:
+            # Most models including gpt-4, gpt-4o, o1, etc.
+            tokens_per_message = 3
+            tokens_per_name = 1
+        
+        num_tokens = 0
+        for message in messages:
+            num_tokens += tokens_per_message
+            
+            # Count tokens for each field in the message
+            for key, value in message.items():
+                if key == "content":
+                    # Handle case where content might be a list (multimodal messages)
+                    if isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                content_text = item.get("text", "")
+                                num_tokens += len(encoder.encode(content_text))
+                            # Note: Image tokens are not counted here as they have fixed costs
+                    elif isinstance(value, str):
+                        num_tokens += len(encoder.encode(value))
+                elif key == "name":
+                    num_tokens += tokens_per_name
+                    if isinstance(value, str):
+                        num_tokens += len(encoder.encode(value))
+                elif key == "role":
+                    # Role is already counted in tokens_per_message
+                    pass
+                elif isinstance(value, str):
+                    # Other string fields
+                    num_tokens += len(encoder.encode(value))
+        
+        # Every reply is primed with assistant role
+        num_tokens += 3
+        return num_tokens
+    
+    def count_text_tokens(self, text: str, model: str = "gpt-3.5-turbo") -> int:
+        """Count tokens in plain text"""
+        encoder = self.get_encoder(model)
+        return len(encoder.encode(text))
+
+# Global token counter instance
+token_counter = TokenCounter()
 
 def generate_random_trigger_signal() -> str:
     """Generate a random, self-closing trigger signal like <Function_AB1c_Start/>."""
@@ -864,6 +990,12 @@ async def chat_completions(
     _api_key: str = Depends(verify_api_key)
 ):
     """Main chat completion endpoint, proxy and inject function calling capabilities."""
+    start_time = time.time()
+    
+    # Count input tokens
+    prompt_tokens = token_counter.count_tokens(body.messages, body.model)
+    logger.info(f"📊 Request to {body.model} - Input tokens: {prompt_tokens}")
+    
     try:
         logger.debug(f"🔧 Received request, model: {body.model}")
         logger.debug(f"🔧 Number of messages: {len(body.messages)}")
@@ -952,6 +1084,59 @@ async def chat_completions(
             
             response_json = upstream_response.json()
             logger.debug(f"🔧 Upstream response status code: {upstream_response.status_code}")
+            
+            # Count output tokens and handle usage
+            completion_text = ""
+            if response_json.get("choices") and len(response_json["choices"]) > 0:
+                content = response_json["choices"][0].get("message", {}).get("content")
+                if content:
+                    completion_text = content
+            
+            # Calculate our estimated tokens
+            estimated_completion_tokens = token_counter.count_text_tokens(completion_text, body.model) if completion_text else 0
+            estimated_prompt_tokens = prompt_tokens
+            estimated_total_tokens = estimated_prompt_tokens + estimated_completion_tokens
+            elapsed_time = time.time() - start_time
+            
+            # Check if upstream provided usage and respect it
+            upstream_usage = response_json.get("usage", {})
+            if upstream_usage:
+                # Preserve upstream's usage structure and only replace zero values
+                final_usage = upstream_usage.copy()
+                
+                # Replace zero or missing values with our estimates
+                if not final_usage.get("prompt_tokens") or final_usage.get("prompt_tokens") == 0:
+                    final_usage["prompt_tokens"] = estimated_prompt_tokens
+                    logger.debug(f"🔧 Replaced zero/missing prompt_tokens with estimate: {estimated_prompt_tokens}")
+                
+                if not final_usage.get("completion_tokens") or final_usage.get("completion_tokens") == 0:
+                    final_usage["completion_tokens"] = estimated_completion_tokens
+                    logger.debug(f"🔧 Replaced zero/missing completion_tokens with estimate: {estimated_completion_tokens}")
+                
+                if not final_usage.get("total_tokens") or final_usage.get("total_tokens") == 0:
+                    final_usage["total_tokens"] = final_usage.get("prompt_tokens", estimated_prompt_tokens) + final_usage.get("completion_tokens", estimated_completion_tokens)
+                    logger.debug(f"🔧 Replaced zero/missing total_tokens with calculated value: {final_usage['total_tokens']}")
+                
+                response_json["usage"] = final_usage
+                logger.debug(f"🔧 Preserved upstream usage with replacements: {final_usage}")
+            else:
+                # No upstream usage, provide our estimates
+                response_json["usage"] = {
+                    "prompt_tokens": estimated_prompt_tokens,
+                    "completion_tokens": estimated_completion_tokens,
+                    "total_tokens": estimated_total_tokens
+                }
+                logger.debug(f"🔧 No upstream usage found, using estimates")
+            
+            # Log token statistics
+            actual_usage = response_json["usage"]
+            logger.info("=" * 60)
+            logger.info(f"📊 Token Usage Statistics - Model: {body.model}")
+            logger.info(f"   Input Tokens: {actual_usage.get('prompt_tokens', 0)}")
+            logger.info(f"   Output Tokens: {actual_usage.get('completion_tokens', 0)}")
+            logger.info(f"   Total Tokens: {actual_usage.get('total_tokens', 0)}")
+            logger.info(f"   Duration: {elapsed_time:.2f}s")
+            logger.info("=" * 60)
             
             if has_function_call:
                 content = response_json["choices"][0]["message"]["content"]
@@ -1051,8 +1236,113 @@ async def chat_completions(
             return JSONResponse(content=error_response, status_code=e.response.status_code)
         
     else:
+        async def stream_with_token_count():
+            completion_tokens = 0
+            completion_text = ""
+            done_received = False
+            upstream_usage_chunk = None  # Store upstream usage chunk if any
+            
+            async for chunk in stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, GLOBAL_TRIGGER_SIGNAL):
+                # Check if this is the [DONE] marker
+                if chunk.startswith(b"data: "):
+                    try:
+                        line_data = chunk[6:].decode('utf-8').strip()
+                        if line_data == "[DONE]":
+                            done_received = True
+                            # Don't yield the [DONE] marker yet, we'll send it after usage info
+                            break
+                        elif line_data:
+                            chunk_json = json.loads(line_data)
+                            
+                            # Check if this chunk contains usage information
+                            if "usage" in chunk_json:
+                                upstream_usage_chunk = chunk_json
+                                logger.debug(f"🔧 Detected upstream usage chunk: {chunk_json['usage']}")
+                                # Don't yield upstream usage chunk yet, we'll process it
+                                continue
+                            
+                            # Process regular content chunks
+                            if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
+                                delta = chunk_json["choices"][0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    completion_text += content
+                    except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+                        logger.debug(f"Failed to parse chunk for token counting: {e}")
+                        pass
+                
+                yield chunk
+            
+            # Calculate our estimated tokens
+            estimated_completion_tokens = token_counter.count_text_tokens(completion_text, body.model) if completion_text else 0
+            estimated_prompt_tokens = prompt_tokens
+            estimated_total_tokens = estimated_prompt_tokens + estimated_completion_tokens
+            elapsed_time = time.time() - start_time
+            
+            # Determine final usage
+            final_usage = None
+            if upstream_usage_chunk and "usage" in upstream_usage_chunk:
+                # Respect upstream usage, but replace zero values
+                upstream_usage = upstream_usage_chunk["usage"]
+                final_usage = upstream_usage.copy()
+                
+                if not final_usage.get("prompt_tokens") or final_usage.get("prompt_tokens") == 0:
+                    final_usage["prompt_tokens"] = estimated_prompt_tokens
+                    logger.debug(f"🔧 Replaced zero/missing prompt_tokens with estimate: {estimated_prompt_tokens}")
+                
+                if not final_usage.get("completion_tokens") or final_usage.get("completion_tokens") == 0:
+                    final_usage["completion_tokens"] = estimated_completion_tokens
+                    logger.debug(f"🔧 Replaced zero/missing completion_tokens with estimate: {estimated_completion_tokens}")
+                
+                if not final_usage.get("total_tokens") or final_usage.get("total_tokens") == 0:
+                    final_usage["total_tokens"] = final_usage.get("prompt_tokens", estimated_prompt_tokens) + final_usage.get("completion_tokens", estimated_completion_tokens)
+                    logger.debug(f"🔧 Replaced zero/missing total_tokens with calculated value: {final_usage['total_tokens']}")
+                
+                logger.debug(f"🔧 Using upstream usage with replacements: {final_usage}")
+            else:
+                # No upstream usage, use our estimates
+                final_usage = {
+                    "prompt_tokens": estimated_prompt_tokens,
+                    "completion_tokens": estimated_completion_tokens,
+                    "total_tokens": estimated_total_tokens
+                }
+                logger.debug(f"🔧 No upstream usage found, using estimates")
+            
+            # Log token statistics
+            logger.info("=" * 60)
+            logger.info(f"📊 Token Usage Statistics - Model: {body.model}")
+            logger.info(f"   Input Tokens: {final_usage['prompt_tokens']}")
+            logger.info(f"   Output Tokens: {final_usage['completion_tokens']}")
+            logger.info(f"   Total Tokens: {final_usage['total_tokens']}")
+            logger.info(f"   Duration: {elapsed_time:.2f}s")
+            logger.info("=" * 60)
+            
+            # Send usage information if requested via stream_options OR if upstream provided usage
+            if (body.stream_options and body.stream_options.get("include_usage", False)) or upstream_usage_chunk:
+                usage_chunk_to_send = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": body.model,
+                    "choices": [],
+                    "usage": final_usage
+                }
+                
+                # If upstream provided additional fields in the usage chunk, preserve them
+                if upstream_usage_chunk:
+                    for key in upstream_usage_chunk:
+                        if key not in ["usage", "choices"] and key not in usage_chunk_to_send:
+                            usage_chunk_to_send[key] = upstream_usage_chunk[key]
+                
+                yield f"data: {json.dumps(usage_chunk_to_send)}\n\n".encode('utf-8')
+                logger.debug(f"🔧 Sent usage chunk in stream: {usage_chunk_to_send['usage']}")
+            
+            # Send [DONE] marker if it was received
+            if done_received:
+                yield b"data: [DONE]\n\n"
+        
         return StreamingResponse(
-            stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, GLOBAL_TRIGGER_SIGNAL),
+            stream_with_token_count(),
             media_type="text/event-stream"
         )
 
@@ -1131,8 +1421,8 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                     error_message = "Request processing failed"
                 
                 error_chunk = {"error": {"message": error_message, "type": "upstream_error"}}
-                yield f"data: {json.dumps(error_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
+                yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+                yield b"data: [DONE]\n\n"
                 return
 
             async for line in response.aiter_lines():
@@ -1151,14 +1441,14 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                     if parsed_tools:
                                         logger.debug(f"🔧 Early finalize: parsed {len(parsed_tools)} tool calls")
                                         for sse in _build_tool_call_sse_chunks(parsed_tools, model):
-                                            yield sse
+                                            yield sse.encode('utf-8')
                                         return
                                     else:
                                         logger.error("❌ Early finalize failed to parse tool calls")
                                         error_content = "Error: Detected tool use signal but failed to parse function call format"
                                         error_chunk = { "id": "error-chunk", "choices": [{"delta": {"content": error_content}}]}
-                                        yield f"data: {json.dumps(error_chunk)}\n\n"
-                                        yield "data: [DONE]\n\n"
+                                        yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+                                        yield b"data: [DONE]\n\n"
                                         return
                             except (json.JSONDecodeError, IndexError):
                                 pass
@@ -1184,7 +1474,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                     "model": model,
                                     "choices": [{"index": 0, "delta": {"content": content_to_yield}}]
                                 }
-                                yield f"data: {json.dumps(yield_chunk)}\n\n"
+                                yield f"data: {json.dumps(yield_chunk)}\n\n".encode('utf-8')
                             
                             if is_detected:
                                 # Tool call signal detected, switch to parsing mode
@@ -1199,8 +1489,8 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
         
         error_message = "Failed to connect to upstream service"
         error_chunk = {"error": {"message": error_message, "type": "connection_error"}}
-        yield f"data: {json.dumps(error_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
+        yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+        yield b"data: [DONE]\n\n"
         return
 
     if detector.state == "tool_parsing":
@@ -1215,7 +1505,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
             logger.error(f"❌ Detected tool call signal but XML parsing failed, buffer content: {detector.content_buffer}")
             error_content = "Error: Detected tool use signal but failed to parse function call format"
             error_chunk = { "id": "error-chunk", "choices": [{"delta": {"content": error_content}}]}
-            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
 
     elif detector.state == "detecting" and detector.content_buffer:
         # If stream has ended but buffer still has remaining characters insufficient to form signal, output them
@@ -1224,9 +1514,9 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
             "created": int(os.path.getmtime(__file__)), "model": model,
             "choices": [{"index": 0, "delta": {"content": detector.content_buffer}}]
         }
-        yield f"data: {json.dumps(final_yield_chunk)}\n\n"
+        yield f"data: {json.dumps(final_yield_chunk)}\n\n".encode('utf-8')
 
-    yield "data: [DONE]\n\n"
+    yield b"data: [DONE]\n\n"
 
 
 @app.get("/")
