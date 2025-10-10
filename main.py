@@ -1421,8 +1421,8 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                     error_message = "Request processing failed"
                 
                 error_chunk = {"error": {"message": error_message, "type": "upstream_error"}}
-                yield f"data: {json.dumps(error_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
+                yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+                yield b"data: [DONE]\n\n"
                 return
 
             async for line in response.aiter_lines():
@@ -1441,14 +1441,14 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                     if parsed_tools:
                                         logger.debug(f"🔧 Early finalize: parsed {len(parsed_tools)} tool calls")
                                         for sse in _build_tool_call_sse_chunks(parsed_tools, model):
-                                            yield sse
+                                            yield sse.encode('utf-8')
                                         return
                                     else:
                                         logger.error("❌ Early finalize failed to parse tool calls")
                                         error_content = "Error: Detected tool use signal but failed to parse function call format"
                                         error_chunk = { "id": "error-chunk", "choices": [{"delta": {"content": error_content}}]}
-                                        yield f"data: {json.dumps(error_chunk)}\n\n"
-                                        yield "data: [DONE]\n\n"
+                                        yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+                                        yield b"data: [DONE]\n\n"
                                         return
                             except (json.JSONDecodeError, IndexError):
                                 pass
@@ -1474,7 +1474,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                     "model": model,
                                     "choices": [{"index": 0, "delta": {"content": content_to_yield}}]
                                 }
-                                yield f"data: {json.dumps(yield_chunk)}\n\n"
+                                yield f"data: {json.dumps(yield_chunk)}\n\n".encode('utf-8')
                             
                             if is_detected:
                                 # Tool call signal detected, switch to parsing mode
@@ -1489,8 +1489,8 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
         
         error_message = "Failed to connect to upstream service"
         error_chunk = {"error": {"message": error_message, "type": "connection_error"}}
-        yield f"data: {json.dumps(error_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
+        yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+        yield b"data: [DONE]\n\n"
         return
 
     if detector.state == "tool_parsing":
@@ -1505,7 +1505,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
             logger.error(f"❌ Detected tool call signal but XML parsing failed, buffer content: {detector.content_buffer}")
             error_content = "Error: Detected tool use signal but failed to parse function call format"
             error_chunk = { "id": "error-chunk", "choices": [{"delta": {"content": error_content}}]}
-            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
 
     elif detector.state == "detecting" and detector.content_buffer:
         # If stream has ended but buffer still has remaining characters insufficient to form signal, output them
@@ -1514,9 +1514,9 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
             "created": int(os.path.getmtime(__file__)), "model": model,
             "choices": [{"index": 0, "delta": {"content": detector.content_buffer}}]
         }
-        yield f"data: {json.dumps(final_yield_chunk)}\n\n"
+        yield f"data: {json.dumps(final_yield_chunk)}\n\n".encode('utf-8')
 
-    yield "data: [DONE]\n\n"
+    yield b"data: [DONE]\n\n"
 
 
 @app.get("/")
