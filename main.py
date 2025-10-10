@@ -15,6 +15,7 @@ import time
 import random
 import threading
 import logging
+import tiktoken
 from typing import List, Dict, Any, Optional, Literal, Union
 from collections import OrderedDict
 
@@ -25,6 +26,131 @@ from pydantic import BaseModel, ValidationError
 from config_loader import config_loader
 
 logger = logging.getLogger(__name__)
+
+# Token Counter for counting tokens
+class TokenCounter:
+    """Token counter using tiktoken"""
+    
+    # Model prefix to encoding mapping (from tiktoken source)
+    MODEL_PREFIX_TO_ENCODING = {
+        "o1-": "o200k_base",
+        "o3-": "o200k_base",
+        "o4-mini-": "o200k_base",
+        # chat
+        "gpt-5-": "o200k_base",
+        "gpt-4.5-": "o200k_base",
+        "gpt-4.1-": "o200k_base",
+        "chatgpt-4o-": "o200k_base",
+        "gpt-4o-": "o200k_base",
+        "gpt-4-": "cl100k_base",
+        "gpt-3.5-turbo-": "cl100k_base",
+        "gpt-35-turbo-": "cl100k_base",  # Azure deployment name
+        "gpt-oss-": "o200k_harmony",
+        # fine-tuned
+        "ft:gpt-4o": "o200k_base",
+        "ft:gpt-4": "cl100k_base",
+        "ft:gpt-3.5-turbo": "cl100k_base",
+        "ft:davinci-002": "cl100k_base",
+        "ft:babbage-002": "cl100k_base",
+    }
+    
+    def __init__(self):
+        self.encoders = {}
+    
+    def get_encoder(self, model: str):
+        """Get or create encoder for the model"""
+        if model not in self.encoders:
+            encoding = None
+            
+            # First try to get encoding from model name directly
+            try:
+                self.encoders[model] = tiktoken.encoding_for_model(model)
+                return self.encoders[model]
+            except KeyError:
+                pass
+            
+            # Try to find encoding by prefix matching
+            for prefix, enc_name in self.MODEL_PREFIX_TO_ENCODING.items():
+                if model.startswith(prefix):
+                    encoding = enc_name
+                    break
+            
+            # Default to o200k_base for newer models
+            if encoding is None:
+                logger.warning(f"Model {model} not found in prefix mapping, using o200k_base encoding")
+                encoding = "o200k_base"
+            
+            try:
+                self.encoders[model] = tiktoken.get_encoding(encoding)
+            except Exception as e:
+                logger.warning(f"Failed to get encoding {encoding} for model {model}: {e}. Falling back to cl100k_base")
+                self.encoders[model] = tiktoken.get_encoding("cl100k_base")
+                
+        return self.encoders[model]
+    
+    def count_tokens(self, messages: list, model: str = "gpt-3.5-turbo") -> int:
+        """Count tokens in message list"""
+        encoder = self.get_encoder(model)
+        
+        # All modern chat models use similar token counting
+        return self._count_chat_tokens(messages, encoder, model)
+    
+    def _count_chat_tokens(self, messages: list, encoder, model: str) -> int:
+        """Accurate token calculation for chat models
+        
+        Based on OpenAI's token counting documentation:
+        - Each message has a fixed overhead
+        - Content tokens are counted per message
+        - Special tokens for message formatting
+        """
+        # Token overhead varies by model
+        if model.startswith(("gpt-3.5-turbo", "gpt-35-turbo")):
+            # gpt-3.5-turbo uses different message overhead
+            tokens_per_message = 4  # <|start|>role<|separator|>content<|end|>
+            tokens_per_name = -1    # Name is omitted if not present
+        else:
+            # Most models including gpt-4, gpt-4o, o1, etc.
+            tokens_per_message = 3
+            tokens_per_name = 1
+        
+        num_tokens = 0
+        for message in messages:
+            num_tokens += tokens_per_message
+            
+            # Count tokens for each field in the message
+            for key, value in message.items():
+                if key == "content":
+                    # Handle case where content might be a list (multimodal messages)
+                    if isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                content_text = item.get("text", "")
+                                num_tokens += len(encoder.encode(content_text))
+                            # Note: Image tokens are not counted here as they have fixed costs
+                    elif isinstance(value, str):
+                        num_tokens += len(encoder.encode(value))
+                elif key == "name":
+                    num_tokens += tokens_per_name
+                    if isinstance(value, str):
+                        num_tokens += len(encoder.encode(value))
+                elif key == "role":
+                    # Role is already counted in tokens_per_message
+                    pass
+                elif isinstance(value, str):
+                    # Other string fields
+                    num_tokens += len(encoder.encode(value))
+        
+        # Every reply is primed with assistant role
+        num_tokens += 3
+        return num_tokens
+    
+    def count_text_tokens(self, text: str, model: str = "gpt-3.5-turbo") -> int:
+        """Count tokens in plain text"""
+        encoder = self.get_encoder(model)
+        return len(encoder.encode(text))
+
+# Global token counter instance
+token_counter = TokenCounter()
 
 def generate_random_trigger_signal() -> str:
     """Generate a random, self-closing trigger signal like <Function_AB1c_Start/>."""
@@ -864,6 +990,12 @@ async def chat_completions(
     _api_key: str = Depends(verify_api_key)
 ):
     """Main chat completion endpoint, proxy and inject function calling capabilities."""
+    start_time = time.time()
+    
+    # Count input tokens
+    prompt_tokens = token_counter.count_tokens(body.messages, body.model)
+    logger.info(f"📊 Request to {body.model} - Input tokens: {prompt_tokens}")
+    
     try:
         logger.debug(f"🔧 Received request, model: {body.model}")
         logger.debug(f"🔧 Number of messages: {len(body.messages)}")
@@ -952,6 +1084,33 @@ async def chat_completions(
             
             response_json = upstream_response.json()
             logger.debug(f"🔧 Upstream response status code: {upstream_response.status_code}")
+            
+            # Count output tokens and add token statistics
+            completion_text = ""
+            if response_json.get("choices") and len(response_json["choices"]) > 0:
+                content = response_json["choices"][0].get("message", {}).get("content")
+                if content:
+                    completion_text = content
+            
+            completion_tokens = token_counter.count_text_tokens(completion_text, body.model) if completion_text else 0
+            total_tokens = prompt_tokens + completion_tokens
+            elapsed_time = time.time() - start_time
+            
+            # Log token statistics
+            logger.info("=" * 60)
+            logger.info(f"📊 Token Usage Statistics - Model: {body.model}")
+            logger.info(f"   Input Tokens: {prompt_tokens}")
+            logger.info(f"   Output Tokens: {completion_tokens}")
+            logger.info(f"   Total Tokens: {total_tokens}")
+            logger.info(f"   Duration: {elapsed_time:.2f}s")
+            logger.info("=" * 60)
+            
+            # Add token usage to response
+            response_json["usage"] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens
+            }
             
             if has_function_call:
                 content = response_json["choices"][0]["message"]["content"]
@@ -1051,8 +1210,42 @@ async def chat_completions(
             return JSONResponse(content=error_response, status_code=e.response.status_code)
         
     else:
+        async def stream_with_token_count():
+            completion_tokens = 0
+            completion_text = ""
+            
+            async for chunk in stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, GLOBAL_TRIGGER_SIGNAL):
+                yield chunk
+                
+                if chunk.startswith(b"data: "):
+                    try:
+                        line_data = chunk[6:].decode('utf-8').strip()
+                        if line_data and line_data != "[DONE]":
+                            chunk_json = json.loads(line_data)
+                            if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
+                                delta = chunk_json["choices"][0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    completion_text += content
+                    except:
+                        pass
+            
+            if completion_text:
+                completion_tokens = token_counter.count_text_tokens(completion_text, body.model)
+            
+            total_tokens = prompt_tokens + completion_tokens
+            elapsed_time = time.time() - start_time
+            
+            logger.info("=" * 60)
+            logger.info(f"📊 Token Usage Statistics - Model: {body.model}")
+            logger.info(f"   Input Tokens: {prompt_tokens}")
+            logger.info(f"   Output Tokens: {completion_tokens}")
+            logger.info(f"   Total Tokens: {total_tokens}")
+            logger.info(f"   Duration: {elapsed_time:.2f}s")
+            logger.info("=" * 60)
+        
         return StreamingResponse(
-            stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, GLOBAL_TRIGGER_SIGNAL),
+            stream_with_token_count(),
             media_type="text/event-stream"
         )
 
