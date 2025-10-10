@@ -1213,29 +1213,38 @@ async def chat_completions(
         async def stream_with_token_count():
             completion_tokens = 0
             completion_text = ""
+            done_received = False
             
             async for chunk in stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, GLOBAL_TRIGGER_SIGNAL):
-                yield chunk
-                
+                # Check if this is the [DONE] marker
                 if chunk.startswith(b"data: "):
                     try:
                         line_data = chunk[6:].decode('utf-8').strip()
-                        if line_data and line_data != "[DONE]":
+                        if line_data == "[DONE]":
+                            done_received = True
+                            # Don't yield the [DONE] marker yet, we'll send it after usage info
+                            break
+                        elif line_data:
                             chunk_json = json.loads(line_data)
                             if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
                                 delta = chunk_json["choices"][0].get("delta", {})
                                 content = delta.get("content", "")
                                 if content:
                                     completion_text += content
-                    except:
+                    except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+                        logger.debug(f"Failed to parse chunk for token counting: {e}")
                         pass
+                
+                yield chunk
             
+            # Calculate tokens after stream completes
             if completion_text:
                 completion_tokens = token_counter.count_text_tokens(completion_text, body.model)
             
             total_tokens = prompt_tokens + completion_tokens
             elapsed_time = time.time() - start_time
             
+            # Log token statistics
             logger.info("=" * 60)
             logger.info(f"📊 Token Usage Statistics - Model: {body.model}")
             logger.info(f"   Input Tokens: {prompt_tokens}")
@@ -1243,6 +1252,27 @@ async def chat_completions(
             logger.info(f"   Total Tokens: {total_tokens}")
             logger.info(f"   Duration: {elapsed_time:.2f}s")
             logger.info("=" * 60)
+            
+            # Send usage information if requested via stream_options
+            if body.stream_options and body.stream_options.get("include_usage", False):
+                usage_chunk = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": body.model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens
+                    }
+                }
+                yield f"data: {json.dumps(usage_chunk)}\n\n".encode('utf-8')
+                logger.debug(f"🔧 Sent usage chunk in stream: {usage_chunk['usage']}")
+            
+            # Send [DONE] marker if it was received
+            if done_received:
+                yield b"data: [DONE]\n\n"
         
         return StreamingResponse(
             stream_with_token_count(),
