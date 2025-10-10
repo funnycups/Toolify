@@ -1085,32 +1085,58 @@ async def chat_completions(
             response_json = upstream_response.json()
             logger.debug(f"🔧 Upstream response status code: {upstream_response.status_code}")
             
-            # Count output tokens and add token statistics
+            # Count output tokens and handle usage
             completion_text = ""
             if response_json.get("choices") and len(response_json["choices"]) > 0:
                 content = response_json["choices"][0].get("message", {}).get("content")
                 if content:
                     completion_text = content
             
-            completion_tokens = token_counter.count_text_tokens(completion_text, body.model) if completion_text else 0
-            total_tokens = prompt_tokens + completion_tokens
+            # Calculate our estimated tokens
+            estimated_completion_tokens = token_counter.count_text_tokens(completion_text, body.model) if completion_text else 0
+            estimated_prompt_tokens = prompt_tokens
+            estimated_total_tokens = estimated_prompt_tokens + estimated_completion_tokens
             elapsed_time = time.time() - start_time
             
+            # Check if upstream provided usage and respect it
+            upstream_usage = response_json.get("usage", {})
+            if upstream_usage:
+                # Preserve upstream's usage structure and only replace zero values
+                final_usage = upstream_usage.copy()
+                
+                # Replace zero or missing values with our estimates
+                if not final_usage.get("prompt_tokens") or final_usage.get("prompt_tokens") == 0:
+                    final_usage["prompt_tokens"] = estimated_prompt_tokens
+                    logger.debug(f"🔧 Replaced zero/missing prompt_tokens with estimate: {estimated_prompt_tokens}")
+                
+                if not final_usage.get("completion_tokens") or final_usage.get("completion_tokens") == 0:
+                    final_usage["completion_tokens"] = estimated_completion_tokens
+                    logger.debug(f"🔧 Replaced zero/missing completion_tokens with estimate: {estimated_completion_tokens}")
+                
+                if not final_usage.get("total_tokens") or final_usage.get("total_tokens") == 0:
+                    final_usage["total_tokens"] = final_usage.get("prompt_tokens", estimated_prompt_tokens) + final_usage.get("completion_tokens", estimated_completion_tokens)
+                    logger.debug(f"🔧 Replaced zero/missing total_tokens with calculated value: {final_usage['total_tokens']}")
+                
+                response_json["usage"] = final_usage
+                logger.debug(f"🔧 Preserved upstream usage with replacements: {final_usage}")
+            else:
+                # No upstream usage, provide our estimates
+                response_json["usage"] = {
+                    "prompt_tokens": estimated_prompt_tokens,
+                    "completion_tokens": estimated_completion_tokens,
+                    "total_tokens": estimated_total_tokens
+                }
+                logger.debug(f"🔧 No upstream usage found, using estimates")
+            
             # Log token statistics
+            actual_usage = response_json["usage"]
             logger.info("=" * 60)
             logger.info(f"📊 Token Usage Statistics - Model: {body.model}")
-            logger.info(f"   Input Tokens: {prompt_tokens}")
-            logger.info(f"   Output Tokens: {completion_tokens}")
-            logger.info(f"   Total Tokens: {total_tokens}")
+            logger.info(f"   Input Tokens: {actual_usage.get('prompt_tokens', 0)}")
+            logger.info(f"   Output Tokens: {actual_usage.get('completion_tokens', 0)}")
+            logger.info(f"   Total Tokens: {actual_usage.get('total_tokens', 0)}")
             logger.info(f"   Duration: {elapsed_time:.2f}s")
             logger.info("=" * 60)
-            
-            # Add token usage to response
-            response_json["usage"] = {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens
-            }
             
             if has_function_call:
                 content = response_json["choices"][0]["message"]["content"]
@@ -1214,6 +1240,7 @@ async def chat_completions(
             completion_tokens = 0
             completion_text = ""
             done_received = False
+            upstream_usage_chunk = None  # Store upstream usage chunk if any
             
             async for chunk in stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, GLOBAL_TRIGGER_SIGNAL):
                 # Check if this is the [DONE] marker
@@ -1226,6 +1253,15 @@ async def chat_completions(
                             break
                         elif line_data:
                             chunk_json = json.loads(line_data)
+                            
+                            # Check if this chunk contains usage information
+                            if "usage" in chunk_json:
+                                upstream_usage_chunk = chunk_json
+                                logger.debug(f"🔧 Detected upstream usage chunk: {chunk_json['usage']}")
+                                # Don't yield upstream usage chunk yet, we'll process it
+                                continue
+                            
+                            # Process regular content chunks
                             if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
                                 delta = chunk_json["choices"][0].get("delta", {})
                                 content = delta.get("content", "")
@@ -1237,38 +1273,69 @@ async def chat_completions(
                 
                 yield chunk
             
-            # Calculate tokens after stream completes
-            if completion_text:
-                completion_tokens = token_counter.count_text_tokens(completion_text, body.model)
-            
-            total_tokens = prompt_tokens + completion_tokens
+            # Calculate our estimated tokens
+            estimated_completion_tokens = token_counter.count_text_tokens(completion_text, body.model) if completion_text else 0
+            estimated_prompt_tokens = prompt_tokens
+            estimated_total_tokens = estimated_prompt_tokens + estimated_completion_tokens
             elapsed_time = time.time() - start_time
+            
+            # Determine final usage
+            final_usage = None
+            if upstream_usage_chunk and "usage" in upstream_usage_chunk:
+                # Respect upstream usage, but replace zero values
+                upstream_usage = upstream_usage_chunk["usage"]
+                final_usage = upstream_usage.copy()
+                
+                if not final_usage.get("prompt_tokens") or final_usage.get("prompt_tokens") == 0:
+                    final_usage["prompt_tokens"] = estimated_prompt_tokens
+                    logger.debug(f"🔧 Replaced zero/missing prompt_tokens with estimate: {estimated_prompt_tokens}")
+                
+                if not final_usage.get("completion_tokens") or final_usage.get("completion_tokens") == 0:
+                    final_usage["completion_tokens"] = estimated_completion_tokens
+                    logger.debug(f"🔧 Replaced zero/missing completion_tokens with estimate: {estimated_completion_tokens}")
+                
+                if not final_usage.get("total_tokens") or final_usage.get("total_tokens") == 0:
+                    final_usage["total_tokens"] = final_usage.get("prompt_tokens", estimated_prompt_tokens) + final_usage.get("completion_tokens", estimated_completion_tokens)
+                    logger.debug(f"🔧 Replaced zero/missing total_tokens with calculated value: {final_usage['total_tokens']}")
+                
+                logger.debug(f"🔧 Using upstream usage with replacements: {final_usage}")
+            else:
+                # No upstream usage, use our estimates
+                final_usage = {
+                    "prompt_tokens": estimated_prompt_tokens,
+                    "completion_tokens": estimated_completion_tokens,
+                    "total_tokens": estimated_total_tokens
+                }
+                logger.debug(f"🔧 No upstream usage found, using estimates")
             
             # Log token statistics
             logger.info("=" * 60)
             logger.info(f"📊 Token Usage Statistics - Model: {body.model}")
-            logger.info(f"   Input Tokens: {prompt_tokens}")
-            logger.info(f"   Output Tokens: {completion_tokens}")
-            logger.info(f"   Total Tokens: {total_tokens}")
+            logger.info(f"   Input Tokens: {final_usage['prompt_tokens']}")
+            logger.info(f"   Output Tokens: {final_usage['completion_tokens']}")
+            logger.info(f"   Total Tokens: {final_usage['total_tokens']}")
             logger.info(f"   Duration: {elapsed_time:.2f}s")
             logger.info("=" * 60)
             
-            # Send usage information if requested via stream_options
-            if body.stream_options and body.stream_options.get("include_usage", False):
-                usage_chunk = {
+            # Send usage information if requested via stream_options OR if upstream provided usage
+            if (body.stream_options and body.stream_options.get("include_usage", False)) or upstream_usage_chunk:
+                usage_chunk_to_send = {
                     "id": f"chatcmpl-{uuid.uuid4().hex}",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": body.model,
                     "choices": [],
-                    "usage": {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens
-                    }
+                    "usage": final_usage
                 }
-                yield f"data: {json.dumps(usage_chunk)}\n\n".encode('utf-8')
-                logger.debug(f"🔧 Sent usage chunk in stream: {usage_chunk['usage']}")
+                
+                # If upstream provided additional fields in the usage chunk, preserve them
+                if upstream_usage_chunk:
+                    for key in upstream_usage_chunk:
+                        if key not in ["usage", "choices"] and key not in usage_chunk_to_send:
+                            usage_chunk_to_send[key] = upstream_usage_chunk[key]
+                
+                yield f"data: {json.dumps(usage_chunk_to_send)}\n\n".encode('utf-8')
+                logger.debug(f"🔧 Sent usage chunk in stream: {usage_chunk_to_send['usage']}")
             
             # Send [DONE] marker if it was received
             if done_received:
