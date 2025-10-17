@@ -1257,9 +1257,11 @@ async def chat_completions(
                             # Check if this chunk contains usage information
                             if "usage" in chunk_json:
                                 upstream_usage_chunk = chunk_json
-                                logger.debug(f"🔧 Detected upstream usage chunk: {chunk_json['usage']}")
-                                # Don't yield upstream usage chunk yet, we'll process it
-                                continue
+                                logger.debug(f"🔧 Detected upstream usage data in chunk")
+                                # Only suppress usage-only chunks (choices missing or empty)
+                                if not ("choices" in chunk_json and len(chunk_json["choices"]) > 0):
+                                    # Don't yield upstream usage-only chunk now; we'll handle usage later
+                                    continue
                             
                             # Process regular content chunks
                             if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
@@ -1317,8 +1319,8 @@ async def chat_completions(
             logger.info(f"   Duration: {elapsed_time:.2f}s")
             logger.info("=" * 60)
             
-            # Send usage information if requested via stream_options OR if upstream provided usage
-            if (body.stream_options and body.stream_options.get("include_usage", False)) or upstream_usage_chunk:
+            # Send usage information only if requested via stream_options.include_usage
+            if body.stream_options and body.stream_options.get("include_usage", False):
                 usage_chunk_to_send = {
                     "id": f"chatcmpl-{uuid.uuid4().hex}",
                     "object": "chat.completion.chunk",
