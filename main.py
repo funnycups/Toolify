@@ -992,10 +992,6 @@ async def chat_completions(
     """Main chat completion endpoint, proxy and inject function calling capabilities."""
     start_time = time.time()
     
-    # Count input tokens
-    prompt_tokens = token_counter.count_tokens(body.messages, body.model)
-    logger.info(f"📊 Request to {body.model} - Input tokens: {prompt_tokens}")
-    
     try:
         logger.debug(f"🔧 Received request, model: {body.model}")
         logger.debug(f"🔧 Number of messages: {len(body.messages)}")
@@ -1061,6 +1057,9 @@ async def chat_completions(
             del request_body_dict["tools"]
         if "tool_choice" in request_body_dict:
             del request_body_dict["tool_choice"]
+
+    prompt_tokens = token_counter.count_tokens(request_body_dict["messages"], body.model)
+    logger.info(f"📊 Request to {body.model} - Actual input tokens (including all preprocessing & injected prompts): {prompt_tokens}")
 
     headers = {
         "Content-Type": "application/json",
@@ -1147,6 +1146,10 @@ async def chat_completions(
                 
                 if parsed_tools:
                     logger.debug(f"🔧 Successfully parsed {len(parsed_tools)} tool calls")
+                    estimated_completion_tokens = token_counter.count_text_tokens(content, body.model)
+                    estimated_total_tokens = estimated_prompt_tokens + estimated_completion_tokens
+                    logger.debug(f"🔧 Completion tokens: {estimated_completion_tokens}")
+                    
                     tool_calls = []
                     for tool in parsed_tools:
                         tool_call_id = f"call_{uuid.uuid4().hex}"
