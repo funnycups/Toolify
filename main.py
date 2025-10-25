@@ -125,20 +125,20 @@ class TokenCounter:
                         for item in value:
                             if isinstance(item, dict) and item.get("type") == "text":
                                 content_text = item.get("text", "")
-                                num_tokens += len(encoder.encode(content_text))
+                                num_tokens += len(encoder.encode(content_text, disallowed_special=()))
                             # Note: Image tokens are not counted here as they have fixed costs
                     elif isinstance(value, str):
-                        num_tokens += len(encoder.encode(value))
+                        num_tokens += len(encoder.encode(value, disallowed_special=()))
                 elif key == "name":
                     num_tokens += tokens_per_name
                     if isinstance(value, str):
-                        num_tokens += len(encoder.encode(value))
+                        num_tokens += len(encoder.encode(value, disallowed_special=()))
                 elif key == "role":
                     # Role is already counted in tokens_per_message
                     pass
                 elif isinstance(value, str):
                     # Other string fields
-                    num_tokens += len(encoder.encode(value))
+                    num_tokens += len(encoder.encode(value, disallowed_special=()))
         
         # Every reply is primed with assistant role
         num_tokens += 3
@@ -147,7 +147,7 @@ class TokenCounter:
     def count_text_tokens(self, text: str, model: str = "gpt-3.5-turbo") -> int:
         """Count tokens in plain text"""
         encoder = self.get_encoder(model)
-        return len(encoder.encode(text))
+        return len(encoder.encode(text, disallowed_special=()))
 
 # Global token counter instance
 token_counter = TokenCounter()
