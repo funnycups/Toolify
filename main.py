@@ -13,11 +13,9 @@ import string
 import traceback
 import time
 import random
-import threading
 import logging
 import tiktoken
 from typing import List, Dict, Any, Optional, Literal, Union
-from collections import OrderedDict
 
 from fastapi import FastAPI, Request, Header, HTTPException, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -192,168 +190,66 @@ except Exception as e:
     logger.error(f"❌ Error details: {str(e)}")
     logger.error("💡 Please ensure config.yaml file exists and is properly formatted")
     exit(1)
-class ToolCallMappingManager:
+def build_tool_call_index_from_messages(messages: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
     """
-    Tool call mapping manager with TTL (Time To Live) and size limit
+    Build tool_call_id -> {name, arguments} index from message history.
+    This replaces the server-side mapping by extracting tool calls from assistant messages.
     
-    Features:
-    1. Automatic expiration cleanup - entries are automatically deleted after specified time
-    2. Size limit - prevents unlimited memory growth
-    3. LRU eviction - removes least recently used entries when size limit is reached
-    4. Thread safe - supports concurrent access
-    5. Periodic cleanup - background thread regularly cleans up expired entries
+    Args:
+        messages: List of message dicts from the request
+        
+    Returns:
+        Dict mapping tool_call_id to {name, arguments}
     """
-    
-    def __init__(self, max_size: int = 1000, ttl_seconds: int = 3600, cleanup_interval: int = 300):
-        """
-        Initialize mapping manager
-        
-        Args:
-            max_size: Maximum number of stored entries
-            ttl_seconds: Entry time to live (seconds)
-            cleanup_interval: Cleanup interval (seconds)
-        """
-        self.max_size = max_size
-        self.ttl_seconds = ttl_seconds
-        self.cleanup_interval = cleanup_interval
-        
-        self._data: OrderedDict[str, Dict[str, Any]] = OrderedDict()
-        self._timestamps: Dict[str, float] = {}
-        self._lock = threading.RLock()
-        
-        self._cleanup_thread = threading.Thread(target=self._periodic_cleanup, daemon=True)
-        self._cleanup_thread.start()
-        
-        logger.debug(f"🔧 [INIT] Tool call mapping manager started - Max entries: {max_size}, TTL: {ttl_seconds}s, Cleanup interval: {cleanup_interval}s")
-    
-    def store(self, tool_call_id: str, name: str, args: dict, description: str = "") -> None:
-        """Store tool call mapping"""
-        with self._lock:
-            current_time = time.time()
-            
-            if tool_call_id in self._data:
-                del self._data[tool_call_id]
-                del self._timestamps[tool_call_id]
-            
-            while len(self._data) >= self.max_size:
-                oldest_key = next(iter(self._data))
-                del self._data[oldest_key]
-                del self._timestamps[oldest_key]
-                logger.debug(f"🔧 [CLEANUP] Removed oldest entry due to size limit: {oldest_key}")
-            
-            self._data[tool_call_id] = {
-                "name": name,
-                "args": args,
-                "description": description,
-                "created_at": current_time
-            }
-            self._timestamps[tool_call_id] = current_time
-            
-            logger.debug(f"🔧 Stored tool call mapping: {tool_call_id} -> {name}")
-            logger.debug(f"🔧 Current mapping table size: {len(self._data)}")
-    
-    def get(self, tool_call_id: str) -> Optional[Dict[str, Any]]:
-        """Get tool call mapping (updates LRU order)"""
-        with self._lock:
-            current_time = time.time()
-            
-            if tool_call_id not in self._data:
-                logger.debug(f"🔧 Tool call mapping not found: {tool_call_id}")
-                logger.debug(f"🔧 All IDs in current mapping table: {list(self._data.keys())}")
-                return None
-            
-            if current_time - self._timestamps[tool_call_id] > self.ttl_seconds:
-                logger.debug(f"🔧 Tool call mapping expired: {tool_call_id}")
-                del self._data[tool_call_id]
-                del self._timestamps[tool_call_id]
-                return None
-            
-            result = self._data[tool_call_id]
-            self._data.move_to_end(tool_call_id)
-            
-            logger.debug(f"🔧 Found tool call mapping: {tool_call_id} -> {result['name']}")
-            return result
-    
-    def cleanup_expired(self) -> int:
-        """Clean up expired entries, return the number of cleaned entries"""
-        with self._lock:
-            current_time = time.time()
-            expired_keys = []
-            
-            for key, timestamp in self._timestamps.items():
-                if current_time - timestamp > self.ttl_seconds:
-                    expired_keys.append(key)
-            
-            for key in expired_keys:
-                del self._data[key]
-                del self._timestamps[key]
-            
-            if expired_keys:
-                logger.debug(f"🔧 [CLEANUP] Cleaned up {len(expired_keys)} expired entries")
-            
-            return len(expired_keys)
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get statistics"""
-        with self._lock:
-            current_time = time.time()
-            expired_count = sum(1 for ts in self._timestamps.values()
-                              if current_time - ts > self.ttl_seconds)
-            
-            return {
-                "total_entries": len(self._data),
-                "expired_entries": expired_count,
-                "active_entries": len(self._data) - expired_count,
-                "max_size": self.max_size,
-                "ttl_seconds": self.ttl_seconds,
-                "memory_usage_ratio": len(self._data) / self.max_size
-            }
-    
-    def _periodic_cleanup(self) -> None:
-        """Background periodic cleanup thread"""
-        while True:
-            try:
-                time.sleep(self.cleanup_interval)
-                cleaned = self.cleanup_expired()
-                
-                stats = self.get_stats()
-                if stats["total_entries"] > 0:
-                    logger.debug(f"🔧 [STATS] Mapping table status: Total={stats['total_entries']}, "
-                               f"Active={stats['active_entries']}, Memory usage={stats['memory_usage_ratio']:.1%}")
-                
-            except Exception as e:
-                logger.error(f"❌ Background cleanup thread exception: {e}")
+    index = {}
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if tool_calls and isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        tc_id = tc.get("id")
+                        func = tc.get("function", {})
+                        if tc_id and isinstance(func, dict):
+                            name = func.get("name", "")
+                            arguments = func.get("arguments", "{}")
+                            if not isinstance(arguments, str):
+                                try:
+                                    arguments = json.dumps(arguments, ensure_ascii=False)
+                                except Exception:
+                                    arguments = str(arguments)
 
-TOOL_CALL_MAPPING_MANAGER = ToolCallMappingManager(
-    max_size=1000,
-    ttl_seconds=3600,
-    cleanup_interval=300
-)
-
-def store_tool_call_mapping(tool_call_id: str, name: str, args: dict, description: str = ""):
-    """Store mapping between tool call ID and call content"""
-    TOOL_CALL_MAPPING_MANAGER.store(tool_call_id, name, args, description)
-
-def get_tool_call_mapping(tool_call_id: str) -> Optional[Dict[str, Any]]:
-    """Get call content corresponding to tool call ID"""
-    return TOOL_CALL_MAPPING_MANAGER.get(tool_call_id)
-
-def format_tool_result_for_ai(tool_call_id: str, result_content: str) -> str:
-    """Format tool call results for AI understanding with English prompts and XML structure"""
-    logger.debug(f"🔧 Formatting tool call result: tool_call_id={tool_call_id}")
-    tool_info = get_tool_call_mapping(tool_call_id)
-    if not tool_info:
-        logger.debug(f"🔧 Tool call mapping not found, using default format")
-        return f"Tool execution result:\n<tool_result>\n{result_content}\n</tool_result>"
+                            if name:
+                                index[tc_id] = {
+                                    "name": name,
+                                    "arguments": arguments
+                                }
+                                logger.debug(f"🔧 Indexed tool_call_id: {tc_id} -> {name}")
     
+    logger.debug(f"🔧 Built tool_call index with {len(index)} entries")
+    return index
+
+def format_tool_result_for_ai(tool_name: str, tool_arguments: str, result_content: str) -> str:
+    """
+    Format tool call results for AI understanding with complete context.
+    
+    Args:
+        tool_name: Name of the tool that was called
+        tool_arguments: Arguments passed to the tool (JSON string)
+        result_content: Execution result from the tool
+        
+    Returns:
+        Formatted text for upstream model
+    """
     formatted_text = f"""Tool execution result:
-- Tool name: {tool_info['name']}
+- Tool name: {tool_name}
+- Tool arguments: {tool_arguments}
 - Execution result:
 <tool_result>
 {result_content}
 </tool_result>"""
     
-    logger.debug(f"🔧 Formatting completed, tool name: {tool_info['name']}")
+    logger.debug(f"🔧 Formatted tool result for {tool_name}")
     return formatted_text
 
 def format_assistant_tool_calls_for_ai(tool_calls: List[Dict[str, Any]], trigger_signal: str) -> str:
@@ -516,6 +412,9 @@ def generate_function_prompt(tools: List[Tool], trigger_signal: str) -> tuple[st
     """
     Generate injected system prompt based on tools definition in client request.
     Returns: (prompt_content, trigger_signal)
+    
+    Raises:
+        HTTPException: If tool schema validation fails (e.g., required keys not in properties)
     """
     tools_list_str = []
     for i, tool in enumerate(tools):
@@ -523,10 +422,43 @@ def generate_function_prompt(tools: List[Tool], trigger_signal: str) -> tuple[st
         name = func.name
         description = func.description or ""
 
-        # Robustly read JSON Schema fields
+        # Robustly read JSON Schema fields + validate basic types
         schema: Dict[str, Any] = func.parameters or {}
-        props: Dict[str, Any] = schema.get("properties", {}) or {}
-        required_list: List[str] = schema.get("required", []) or []
+
+        props_raw = schema.get("properties", {})
+        if props_raw is None:
+            props_raw = {}
+        if not isinstance(props_raw, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tool '{name}': 'properties' must be an object, got {type(props_raw).__name__}"
+            )
+        props: Dict[str, Any] = props_raw
+
+        required_raw = schema.get("required", [])
+        if required_raw is None:
+            required_raw = []
+        if not isinstance(required_raw, list):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tool '{name}': 'required' must be a list, got {type(required_raw).__name__}"
+            )
+
+        non_string_required = [k for k in required_raw if not isinstance(k, str)]
+        if non_string_required:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tool '{name}': 'required' entries must be strings, got {non_string_required}"
+            )
+
+        required_list: List[str] = required_raw
+
+        missing_keys = [key for key in required_list if key not in props]
+        if missing_keys:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tool '{name}': required parameters {missing_keys} are not defined in properties"
+            )
 
         # Brief summary line: name (type)
         params_summary = ", ".join([
@@ -636,6 +568,39 @@ def remove_think_blocks(text: str) -> str:
             break
     
     return text
+
+def find_last_trigger_signal_outside_think(text: str, trigger_signal: str) -> int:
+    """
+    Find the last occurrence position of trigger_signal that is NOT inside any <think>...</think> block.
+    Returns -1 if not found.
+    """
+    if not text or not trigger_signal:
+        return -1
+
+    i = 0
+    think_depth = 0
+    last_pos = -1
+
+    while i < len(text):
+        if text.startswith("<think>", i):
+            think_depth += 1
+            i += 7
+            continue
+
+        if text.startswith("</think>", i):
+            think_depth = max(0, think_depth - 1)
+            i += 8
+            continue
+
+        if think_depth == 0 and text.startswith(trigger_signal, i):
+            last_pos = i
+            # Move forward by 1 to allow overlapping search (not expected, but safe)
+            i += 1
+            continue
+
+        i += 1
+
+    return last_pos
 
 class StreamingFunctionCallDetector:
     """Enhanced streaming function call detector, supports dynamic trigger signals, avoids misjudgment within <think> tags
@@ -898,6 +863,38 @@ async def validation_exception_handler(request: Request, exc: ValidationError):
         }
     )
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle FastAPI HTTPException with OpenAI-compatible error envelope"""
+    status = exc.status_code
+
+    if status == 400:
+        err_type = "invalid_request_error"
+        code = "invalid_request"
+    elif status == 401:
+        err_type = "authentication_error"
+        code = "unauthorized"
+    elif status == 403:
+        err_type = "permission_error"
+        code = "forbidden"
+    elif status == 429:
+        err_type = "rate_limit_error"
+        code = "rate_limit_exceeded"
+    else:
+        err_type = "server_error"
+        code = "internal_error"
+
+    return JSONResponse(
+        status_code=status,
+        content={
+            "error": {
+                "message": str(exc.detail),
+                "type": err_type,
+                "code": code,
+            }
+        },
+    )
+
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
     """Handle all uncaught exceptions"""
@@ -928,30 +925,55 @@ async def verify_api_key(authorization: str = Header(...)):
     return client_key
 
 def preprocess_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Preprocess messages, convert tool-type messages to AI-understandable format, return dictionary list to avoid Pydantic validation issues"""
-    processed_messages = []
-    
+    """
+    Preprocess messages:
+    - Convert role=tool messages to role=user text for upstream compatibility
+    - Convert assistant.tool_calls into assistant.content (XML format) for upstream context
+    - Convert developer->system if configured
+    """
+    tool_call_index = build_tool_call_index_from_messages(messages)
+
+    processed_messages: List[Dict[str, Any]] = []
+
     for message in messages:
         if isinstance(message, dict):
             if message.get("role") == "tool":
                 tool_call_id = message.get("tool_call_id")
                 content = message.get("content")
-                
-                if tool_call_id and content:
-                    formatted_content = format_tool_result_for_ai(tool_call_id, content)
-                    processed_message = {
-                        "role": "user",
-                        "content": formatted_content
-                    }
-                    processed_messages.append(processed_message)
-                    logger.debug(f"🔧 Converted tool message to user message: tool_call_id={tool_call_id}")
-                else:
-                    logger.debug(f"🔧 Skipped invalid tool message: tool_call_id={tool_call_id}, content={bool(content)}")
-            elif message.get("role") == "assistant" and "tool_calls" in message and message["tool_calls"]:
+
+                if not tool_call_id:
+                    raise HTTPException(status_code=400, detail="Tool message missing tool_call_id")
+
+                # content may be empty string in some cases; only reject None
+                if content is None:
+                    raise HTTPException(status_code=400, detail=f"Tool message missing content for tool_call_id={tool_call_id}")
+
+                tool_info = tool_call_index.get(tool_call_id)
+                if not tool_info:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"tool_call_id={tool_call_id} not found in conversation history. "
+                            f"Ensure the assistant message with this tool_call is included in the messages array."
+                        )
+                    )
+
+                formatted_content = format_tool_result_for_ai(
+                    tool_name=tool_info["name"],
+                    tool_arguments=tool_info["arguments"],
+                    result_content=content,
+                )
+
+                processed_messages.append({
+                    "role": "user",
+                    "content": formatted_content
+                })
+                logger.debug(f"🔧 Converted tool message to user message: tool_call_id={tool_call_id}, tool={tool_info['name']}")
+
+            elif message.get("role") == "assistant" and message.get("tool_calls"):
                 tool_calls = message.get("tool_calls", [])
                 formatted_tool_calls_str = format_assistant_tool_calls_for_ai(tool_calls, GLOBAL_TRIGGER_SIGNAL)
-                
-                # Combine with original content if it exists
+
                 original_content = message.get("content") or ""
                 final_content = f"{original_content}\n{formatted_tool_calls_str}".strip()
 
@@ -959,28 +981,27 @@ def preprocess_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "role": "assistant",
                     "content": final_content
                 }
-                # Copy other potential keys from the original message, except tool_calls
                 for key, value in message.items():
                     if key not in ["role", "content", "tool_calls"]:
                         processed_message[key] = value
 
                 processed_messages.append(processed_message)
-                logger.debug(f"🔧 Converted assistant tool_calls to content.")
+                logger.debug("🔧 Converted assistant tool_calls to content.")
 
             elif message.get("role") == "developer":
                 if app_config.features.convert_developer_to_system:
                     processed_message = message.copy()
                     processed_message["role"] = "system"
                     processed_messages.append(processed_message)
-                    logger.debug(f"🔧 Converted developer message to system message for better upstream compatibility")
+                    logger.debug("🔧 Converted developer message to system message for better upstream compatibility")
                 else:
                     processed_messages.append(message)
-                    logger.debug(f"🔧 Keeping developer role unchanged (based on configuration)")
+                    logger.debug("🔧 Keeping developer role unchanged (based on configuration)")
             else:
                 processed_messages.append(message)
         else:
             processed_messages.append(message)
-    
+
     return processed_messages
 
 @app.post("/v1/chat/completions")
@@ -1017,6 +1038,32 @@ async def chat_completions(
         
         logger.debug(f"🔧 Request body constructed, message count: {len(processed_messages)}")
         
+    except HTTPException as e:
+        # Preserve expected status codes (e.g., 400 for invalid tool_call_id history)
+        logger.error(f"❌ Request rejected: status_code={e.status_code}, detail={e.detail}")
+        return JSONResponse(
+            status_code=e.status_code,
+            content={
+                "error": {
+                    "message": str(e.detail),
+                    "type": "invalid_request_error" if e.status_code == 400 else (
+                        "authentication_error" if e.status_code == 401 else (
+                            "permission_error" if e.status_code == 403 else (
+                                "rate_limit_error" if e.status_code == 429 else "server_error"
+                            )
+                        )
+                    ),
+                    "code": "invalid_request" if e.status_code == 400 else (
+                        "unauthorized" if e.status_code == 401 else (
+                            "forbidden" if e.status_code == 403 else (
+                                "rate_limit_exceeded" if e.status_code == 429 else "internal_error"
+                            )
+                        )
+                    )
+                }
+            }
+        )
+
     except Exception as e:
         logger.error(f"❌ Request preprocessing failed: {str(e)}")
         logger.error(f"❌ Error type: {type(e).__name__}")
@@ -1039,7 +1086,7 @@ async def chat_completions(
         
         function_prompt, _ = generate_function_prompt(body.tools, GLOBAL_TRIGGER_SIGNAL)
         
-        tool_choice_prompt = safe_process_tool_choice(body.tool_choice)
+        tool_choice_prompt = safe_process_tool_choice(body.tool_choice, body.tools)
         if tool_choice_prompt:
             function_prompt += tool_choice_prompt
 
@@ -1153,12 +1200,6 @@ async def chat_completions(
                     tool_calls = []
                     for tool in parsed_tools:
                         tool_call_id = f"call_{uuid.uuid4().hex}"
-                        store_tool_call_mapping(
-                            tool_call_id,
-                            tool["name"],
-                            tool["args"],
-                            f"Calling tool {tool['name']}"
-                        )
                         tool_calls.append({
                             "id": tool_call_id,
                             "type": "function",
@@ -1169,9 +1210,16 @@ async def chat_completions(
                         })
                     logger.debug(f"🔧 Converted tool_calls: {tool_calls}")
                     
+                    prefix_pos = find_last_trigger_signal_outside_think(content, GLOBAL_TRIGGER_SIGNAL)
+                    prefix_text = None
+                    if prefix_pos != -1:
+                        prefix_text = content[:prefix_pos].rstrip()
+                        if prefix_text == "":
+                            prefix_text = None
+
                     response_json["choices"][0]["message"] = {
                         "role": "assistant",
-                        "content": None,
+                        "content": prefix_text,
                         "tool_calls": tool_calls,
                     }
                     response_json["choices"][0]["finish_reason"] = "tool_calls"
@@ -1374,12 +1422,6 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
         tool_calls = []
         for i, tool in enumerate(parsed_tools):
             tool_call_id = f"call_{uuid.uuid4().hex}"
-            store_tool_call_mapping(
-                tool_call_id,
-                tool["name"],
-                tool["args"],
-                f"Calling tool {tool['name']}"
-            )
             tool_calls.append({
                 "index": i, "id": tool_call_id, "type": "function",
                 "function": { "name": tool["name"], "arguments": json.dumps(tool["args"]) }
@@ -1486,7 +1528,8 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                 continue
                     
                     except (json.JSONDecodeError, IndexError):
-                        yield line + "\n\n"
+                        # Ensure we always yield bytes to keep stream_with_token_count() stable
+                        yield (line + "\n\n").encode("utf-8")
 
     except httpx.RequestError as e:
         logger.error(f"❌ Failed to connect to upstream service: {e}")
@@ -1504,7 +1547,8 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
         if parsed_tools:
             logger.debug(f"🔧 Streaming processing: Successfully parsed {len(parsed_tools)} tool calls")
             for sse in _build_tool_call_sse_chunks(parsed_tools, model):
-                yield sse
+                # Ensure we always yield bytes to keep stream_with_token_count() stable
+                yield sse.encode("utf-8")
             return
         else:
             logger.error(f"❌ Detected tool call signal but XML parsing failed, buffer content: {detector.content_buffer}")
@@ -1617,8 +1661,20 @@ def validate_message_structure(messages: List[Dict[str, Any]]) -> bool:
         logger.error(f"❌ Message validation exception: {e}")
         return False
 
-def safe_process_tool_choice(tool_choice) -> str:
-    """Safely process tool_choice field to avoid type errors"""
+def safe_process_tool_choice(tool_choice, tools: Optional[List[Tool]] = None) -> str:
+    """
+    Process tool_choice field and return additional prompt instructions.
+    
+    Args:
+        tool_choice: The tool_choice value from the request (str or ToolChoice object)
+        tools: List of available tools (for validation when specific tool is required)
+        
+    Returns:
+        Additional prompt text to append to the function calling prompt
+        
+    Raises:
+        HTTPException: If tool_choice specifies a tool that doesn't exist in tools list
+    """
     try:
         if tool_choice is None:
             return ""
@@ -1626,18 +1682,44 @@ def safe_process_tool_choice(tool_choice) -> str:
         if isinstance(tool_choice, str):
             if tool_choice == "none":
                 return "\n\n**IMPORTANT:** You are prohibited from using any tools in this round. Please respond like a normal chat assistant and answer the user's question directly."
+            elif tool_choice == "auto":
+                # Default behavior, no additional constraints
+                return ""
+            elif tool_choice == "required":
+                return "\n\n**IMPORTANT:** You MUST call at least one tool in this response. Do not respond without using tools."
             else:
-                logger.debug(f"🔧 Unknown tool_choice string value: {tool_choice}")
+                logger.warning(f"⚠️ Unknown tool_choice string value: {tool_choice}")
                 return ""
         
-        elif hasattr(tool_choice, 'function') and hasattr(tool_choice.function, 'name'):
-            required_tool_name = tool_choice.function.name
+        # Handle ToolChoice object: {"type": "function", "function": {"name": "xxx"}}
+        elif hasattr(tool_choice, 'function'):
+            function_dict = tool_choice.function
+            if not isinstance(function_dict, dict):
+                raise HTTPException(status_code=400, detail="tool_choice.function must be an object")
+
+            required_tool_name = function_dict.get("name")
+            if not required_tool_name or not isinstance(required_tool_name, str):
+                raise HTTPException(status_code=400, detail="tool_choice.function.name must be a non-empty string")
+
+            if not tools:
+                raise HTTPException(status_code=400, detail="tool_choice requires a non-empty tools list in the request")
+
+            tool_names = [t.function.name for t in tools]
+            if required_tool_name not in tool_names:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"tool_choice specifies tool '{required_tool_name}' which is not in the tools list. Available tools: {tool_names}"
+                )
+
             return f"\n\n**IMPORTANT:** In this round, you must use ONLY the tool named `{required_tool_name}`. Generate the necessary parameters and output in the specified XML format."
         
         else:
-            logger.debug(f"🔧 Unsupported tool_choice type: {type(tool_choice)}")
+            logger.warning(f"⚠️ Unsupported tool_choice type: {type(tool_choice)}")
             return ""
     
+    except HTTPException:
+        # Re-raise HTTPException to preserve status code
+        raise
     except Exception as e:
         logger.error(f"❌ Error processing tool_choice: {e}")
         return ""
