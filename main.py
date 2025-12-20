@@ -1134,9 +1134,18 @@ async def chat_completions(
             # Count output tokens and handle usage
             completion_text = ""
             if response_json.get("choices") and len(response_json["choices"]) > 0:
-                content = response_json["choices"][0].get("message", {}).get("content")
+                message = response_json["choices"][0].get("message", {})
+                
+                # Extract content
+                content = message.get("content")
                 if content:
                     completion_text = content
+                
+                # Check for reasoning_content
+                reasoning_content = message.get("reasoning_content")
+                if reasoning_content:
+                    completion_text = (completion_text + "\n" + reasoning_content).strip() if completion_text else reasoning_content
+                    logger.debug(f"🔧 Found reasoning_content, adding {len(reasoning_content)} chars to token count")
             
             # Calculate our estimated tokens
             estimated_completion_tokens = token_counter.count_text_tokens(completion_text, body.model) if completion_text else 0
@@ -1317,9 +1326,17 @@ async def chat_completions(
                             # Process regular content chunks
                             if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
                                 delta = chunk_json["choices"][0].get("delta", {})
+                                
+                                # Accumulate content
                                 content = delta.get("content", "")
                                 if content:
                                     completion_text += content
+                                
+                                # Accumulate reasoning_content
+                                reasoning_content = delta.get("reasoning_content", "")
+                                if reasoning_content:
+                                    completion_text += reasoning_content
+                                    logger.debug(f"🔧 Found reasoning_content in stream, accumulating for token count")
                     except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
                         logger.debug(f"Failed to parse chunk for token counting: {e}")
                         pass
