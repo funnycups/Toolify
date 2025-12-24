@@ -1566,10 +1566,12 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                             yield sse.encode('utf-8')
                                         return
                                     else:
-                                        logger.error("❌ Early finalize failed to parse tool calls")
-                                        error_content = "Error: Detected tool use signal but failed to parse function call format"
-                                        error_chunk = { "id": "error-chunk", "choices": [{"delta": {"content": error_content}}]}
-                                        yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+                                        logger.warning(
+                                            "⚠️ Early finalize detected </function_calls> but failed to parse tool calls; "
+                                            "silently ending stream. buffer_len=%s preview=%r",
+                                            len(detector.content_buffer),
+                                            detector.content_buffer[:200],
+                                        )
                                         yield b"data: [DONE]\n\n"
                                         return
                             except (json.JSONDecodeError, IndexError):
@@ -1626,10 +1628,12 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                 yield sse.encode("utf-8")
             return
         else:
-            logger.error(f"❌ Detected tool call signal but XML parsing failed, buffer content: {detector.content_buffer}")
-            error_content = "Error: Detected tool use signal but failed to parse function call format"
-            error_chunk = { "id": "error-chunk", "choices": [{"delta": {"content": error_content}}]}
-            yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+            logger.warning(
+                "⚠️ Detected tool call signal but XML parsing failed; silently returning model text only. "
+                "buffer_len=%s preview=%r",
+                len(detector.content_buffer),
+                detector.content_buffer[:300],
+            )
 
     elif detector.state == "detecting" and detector.content_buffer:
         # If stream has ended but buffer still has remaining characters insufficient to form signal, output them
