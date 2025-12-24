@@ -15,6 +15,7 @@ import time
 import random
 import logging
 import tiktoken
+import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Literal, Union
 
 from fastapi import FastAPI, Request, Header, HTTPException, Depends
@@ -255,6 +256,11 @@ def format_tool_result_for_ai(tool_name: str, tool_arguments: str, result_conten
 def format_assistant_tool_calls_for_ai(tool_calls: List[Dict[str, Any]], trigger_signal: str) -> str:
     """Format assistant tool calls into AI-readable string format."""
     logger.debug(f"🔧 Formatting assistant tool calls. Count: {len(tool_calls)}")
+
+    def _wrap_cdata(text: str) -> str:
+        # Avoid illegal ']]>' sequence inside CDATA by splitting.
+        safe = (text or "").replace("]]>", "]]]]><![CDATA[>")
+        return f"<![CDATA[{safe}]]>"
     
     xml_calls_parts = []
     for tool_call in tool_calls:
@@ -269,15 +275,13 @@ def format_assistant_tool_calls_for_ai(tool_calls: List[Dict[str, Any]], trigger
             # If it's not a valid JSON string, treat it as a simple string.
             args_dict = {"raw_arguments": arguments_json}
 
-        args_parts = []
-        for key, value in args_dict.items():
-            # Dump the value back to a JSON string for consistent representation inside XML.
-            json_value = json.dumps(value, ensure_ascii=False)
-            args_parts.append(f"<{key}>{json_value}</{key}>")
-        
-        args_content = "\n".join(args_parts)
-        
-        xml_call = f"<function_call>\n<tool>{name}</tool>\n<args>\n{args_content}\n</args>\n</function_call>"
+        args_payload = json.dumps(args_dict, ensure_ascii=False)
+        xml_call = (
+            f"<function_call>\n"
+            f"<tool>{name}</tool>\n"
+            f"<args_json>{_wrap_cdata(args_payload)}</args_json>\n"
+            f"</function_call>"
+        )
         xml_calls_parts.append(xml_call)
 
     all_calls = "\n".join(xml_calls_parts)
@@ -323,28 +327,22 @@ No leading or trailing spaces, output exactly as shown above. The trigger signal
 
 STRICT ARGUMENT KEY RULES:
 - You MUST use parameter keys EXACTLY as defined (case- and punctuation-sensitive). Do NOT rename, add, or remove characters.
-- If a key starts with a hyphen (e.g., -i, -C), you MUST keep the hyphen in the tag name. Example: <-i>true</-i>, <-C>2</-C>.
-- Never convert "-i" to "i" or "-C" to "C". Do not pluralize, translate, or alias parameter keys.
+- If a key starts with a hyphen (e.g., "-i", "-C"), you MUST keep the leading hyphen in the JSON key. Never convert "-i" to "i" or "-C" to "C".
 - The <tool> tag must contain the exact name of a tool from the list. Any other tool name is invalid.
-- The <args> must contain all required arguments for that tool.
+- The <args_json> tag must contain a single JSON object with all required arguments for that tool.
+- You MAY wrap the JSON content inside <![CDATA[...]]> to avoid XML escaping issues.
 
-CORRECT Example (multiple tool calls, including hyphenated keys):
+CORRECT Example (multiple tool calls):
 ...response content (optional)...
 {trigger_signal}
 <function_calls>
     <function_call>
         <tool>Grep</tool>
-        <args>
-            <-i>true</-i>
-            <-C>2</-C>
-            <path>.</path>
-        </args>
+        <args_json><![CDATA[{"-i": true, "-C": 2, "path": "."}]]></args_json>
     </function_call>
     <function_call>
         <tool>search</tool>
-        <args>
-            <keywords>["Python Document", "how to use python"]</keywords>
-        </args>
+        <args_json><![CDATA[{"keywords": ["Python Document", "how to use python"]}]]></args_json>
     </function_call>
   </function_calls>
 
@@ -738,46 +736,106 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
     if not calls_content_match:
         logger.debug(f"🔧 No function_calls tag found")
         return None
-    
+
+    calls_xml = calls_content_match.group(0)
     calls_content = calls_content_match.group(1)
     logger.debug(f"🔧 function_calls content: {repr(calls_content)}")
-    
-    results = []
+
+    def _coerce_value(v: str):
+        try:
+            return json.loads(v)
+        except Exception:
+            return v
+
+    def _parse_args_json_payload(payload: str) -> Dict[str, Any]:
+        if payload is None:
+            return {}
+        s = payload.strip()
+        if not s:
+            return {}
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, dict):
+                return parsed
+            return {"raw_arguments": parsed}
+        except Exception:
+            return {"raw_arguments": s}
+
+    def _extract_cdata_text(raw: str) -> str:
+        if raw is None:
+            return ""
+        if "<![CDATA[" not in raw:
+            return raw
+        parts = re.findall(r"<!\[CDATA\[(.*?)\]\]>", raw, flags=re.DOTALL)
+        return "".join(parts) if parts else raw
+
+    results: List[Dict[str, Any]] = []
+
+    # Primary path: strict XML parse (requires model to output valid XML)
+    try:
+        root = ET.fromstring(calls_xml)
+        for i, fc in enumerate(root.findall("function_call")):
+            tool_el = fc.find("tool")
+            name = (tool_el.text or "").strip() if tool_el is not None else ""
+            if not name:
+                logger.debug(f"🔧 No tool tag found in function_call #{i+1}")
+                continue
+
+            args: Dict[str, Any] = {}
+
+            args_json_el = fc.find("args_json")
+            if args_json_el is not None:
+                args = _parse_args_json_payload(args_json_el.text or "")
+            else:
+                # Legacy fallback: <args><k>json</k></args>
+                args_el = fc.find("args")
+                if args_el is not None:
+                    for child in list(args_el):
+                        args[child.tag] = _coerce_value(child.text or "")
+
+            result = {"name": name, "args": args}
+            results.append(result)
+            logger.debug(f"🔧 Added tool call: {result}")
+
+        logger.debug(f"🔧 Final parsing result (XML): {results}")
+        return results if results else None
+    except Exception as e:
+        logger.debug(f"🔧 XML library parse failed, falling back to regex parser: {type(e).__name__}: {e}")
+
+    # Fallback path: regex parse (more tolerant to malformed XML)
     call_blocks = re.findall(r"<function_call>([\s\S]*?)</function_call>", calls_content)
     logger.debug(f"🔧 Found {len(call_blocks)} function_call blocks")
-    
+
     for i, block in enumerate(call_blocks):
         logger.debug(f"🔧 Processing function_call #{i+1}: {repr(block)}")
-        
+
         tool_match = re.search(r"<tool>(.*?)</tool>", block)
         if not tool_match:
             logger.debug(f"🔧 No tool tag found in block #{i+1}")
             continue
-        
+
         name = tool_match.group(1).strip()
-        args = {}
-        
-        args_block_match = re.search(r"<args>([\s\S]*?)</args>", block)
-        if args_block_match:
-            args_content = args_block_match.group(1)
-            # Support arg tag names containing hyphens (e.g., -i, -A); match any non-space, non-'>' and non-'/' chars
-            arg_matches = re.findall(r"<([^\s>/]+)>([\s\S]*?)</\1>", args_content)
+        args: Dict[str, Any] = {}
 
-            def _coerce_value(v: str):
-                try:
-                    return json.loads(v)
-                except Exception:
-                    pass
-                return v
+        args_json_match = re.search(r"<args_json>([\s\S]*?)</args_json>", block)
+        if args_json_match:
+            raw_payload = args_json_match.group(1)
+            payload = _extract_cdata_text(raw_payload)
+            args = _parse_args_json_payload(payload)
+        else:
+            # Legacy fallback
+            args_block_match = re.search(r"<args>([\s\S]*?)</args>", block)
+            if args_block_match:
+                args_content_inner = args_block_match.group(1)
+                arg_matches = re.findall(r"<([^\s>/]+)>([\s\S]*?)</\1>", args_content_inner)
+                for k, v in arg_matches:
+                    args[k] = _coerce_value(v)
 
-            for k, v in arg_matches:
-                args[k] = _coerce_value(v)
-        
         result = {"name": name, "args": args}
         results.append(result)
         logger.debug(f"🔧 Added tool call: {result}")
-    
-    logger.debug(f"🔧 Final parsing result: {results}")
+
+    logger.debug(f"🔧 Final parsing result (regex): {results}")
     return results if results else None
 
 def find_upstream(model_name: str) -> tuple[Dict[str, Any], str]:
