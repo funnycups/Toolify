@@ -338,11 +338,11 @@ CORRECT Example (multiple tool calls):
 <function_calls>
     <function_call>
         <tool>Grep</tool>
-        <args_json><![CDATA[{"-i": true, "-C": 2, "path": "."}]]></args_json>
+        <args_json><![CDATA[{{"-i": true, "-C": 2, "path": "."}}]]></args_json>
     </function_call>
     <function_call>
         <tool>search</tool>
-        <args_json><![CDATA[{"keywords": ["Python Document", "how to use python"]}]]></args_json>
+        <args_json><![CDATA[{{"keywords": ["Python Document", "how to use python"]}}]]></args_json>
     </function_call>
   </function_calls>
 
