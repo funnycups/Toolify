@@ -361,6 +361,12 @@ I will call the tools for you.
     </function_call>
 </function_calls>
 
+INCORRECT Example (output non-XML format — DO NOT DO THIS):
+...response content (optional)...
+```json
+{{"files":[{{"path":"system.py"}}]}}
+```
+
 Now please be ready to strictly follow the above specifications.
 """
 
