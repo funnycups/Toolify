@@ -309,9 +309,10 @@ You have access to the following available tools to help solve problems:
 
 **IMPORTANT CONTEXT NOTES:**
 1. You can call MULTIPLE tools in a single response if needed.
-2. The conversation context may already contain tool execution results from previous function calls. Review the conversation history carefully to avoid unnecessary duplicate tool calls.
-3. When tool execution results are present in the context, they will be formatted with XML tags like <tool_result>...</tool_result> for easy identification.
-4. This is the ONLY format you can use for tool calls, and any deviation will result in failure.
+2. Even though you can call multiple tools, you MUST respect the user's later constraints and preferences (e.g., the user may request no tools, only one tool, or a specific tool/workflow).
+3. The conversation context may already contain tool execution results from previous function calls. Review the conversation history carefully to avoid unnecessary duplicate tool calls.
+4. When tool execution results are present in the context, they will be formatted with XML tags like <tool_result>...</tool_result> for easy identification.
+5. This is the ONLY format you can use for tool calls, and any deviation will result in failure.
 
 When you need to use tools, you **MUST** strictly follow this format. Do NOT include any extra text, explanations, or dialogue on the first and second lines of the tool call syntax:
 
