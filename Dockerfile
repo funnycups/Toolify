@@ -14,6 +14,4 @@ ENV PYTHONUNBUFFERED=1 \
 	PYTHONIOENCODING=UTF-8 \
 	PYTHONDONTWRITEBYTECODE=1
 
-ENTRYPOINT ["python", "-u", "-m", "uvicorn"]
-
-CMD ["main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-u", "main.py"]
