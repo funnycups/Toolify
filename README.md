@@ -59,7 +59,7 @@ This is the recommended way for easy deployment.
 3. **Start the service:**
 
    ```bash
-   docker-compose up -d --build
+   docker-compose up -d
    ```
 
    This will build the Docker image and start the Toolify service in detached mode, accessible at `http://localhost:8000`.

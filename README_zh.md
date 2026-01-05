@@ -59,7 +59,7 @@ Toolify 是一个中间件代理，旨在为那些本身不支持函数调用功
 3. **启动服务：**
 
    ```bash
-   docker-compose up -d --build
+   docker-compose up -d
    ```
 
    这将构建 Docker 镜像并以后台模式启动 Toolify 服务，可通过 `http://localhost:8000` 访问。
