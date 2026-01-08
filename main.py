@@ -1657,7 +1657,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
 @app.get("/")
 def read_root():
     return {
-        "status": "OpenAI Function Call Middleware is running",
+        "status": "Toolify is running",
         "config": {
             "upstream_services_count": len(app_config.upstream_services),
             "client_keys_count": len(app_config.client_authentication.allowed_keys),
