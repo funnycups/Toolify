@@ -1584,6 +1584,14 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                             len(detector.content_buffer),
                                             detector.content_buffer[:200],
                                         )
+                                        stop_chunk = {
+                                            "id": f"chatcmpl-{uuid.uuid4().hex}",
+                                            "object": "chat.completion.chunk",
+                                            "created": int(os.path.getmtime(__file__)),
+                                            "model": model,
+                                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                                        }
+                                        yield f"data: {json.dumps(stop_chunk)}\n\n".encode('utf-8')
                                         yield b"data: [DONE]\n\n"
                                         return
                             except (json.JSONDecodeError, IndexError):
@@ -1597,7 +1605,9 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                     
                     try:
                         chunk_json = json.loads(line_data)
-                        delta_content = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "") or ""
+                        delta = chunk_json.get("choices", [{}])[0].get("delta", {})
+                        delta_content = delta.get("content", "") or ""
+                        finish_reason = chunk_json.get("choices", [{}])[0].get("finish_reason")
                         
                         if delta_content:
                             is_detected, content_to_yield = detector.process_chunk(delta_content)
@@ -1615,6 +1625,16 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                             if is_detected:
                                 # Tool call signal detected, switch to parsing mode
                                 continue
+                        
+                        if finish_reason:
+                            finish_chunk = {
+                                "id": chunk_json.get("id") or f"chatcmpl-passthrough-{uuid.uuid4().hex}",
+                                "object": "chat.completion.chunk",
+                                "created": chunk_json.get("created") or int(os.path.getmtime(__file__)),
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                            }
+                            yield f"data: {json.dumps(finish_chunk)}\n\n".encode('utf-8')
                     
                     except (json.JSONDecodeError, IndexError):
                         # Ensure we always yield bytes to keep stream_with_token_count() stable
@@ -1641,11 +1661,21 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
             return
         else:
             logger.warning(
-                "⚠️ Detected tool call signal but XML parsing failed; silently returning model text only. "
+                "⚠️ Detected tool call signal but XML parsing failed; outputting accumulated text. "
                 "buffer_len=%s preview=%r",
                 len(detector.content_buffer),
                 detector.content_buffer[:300],
             )
+            # Output the accumulated content if any
+            if detector.content_buffer:
+                content_chunk = {
+                    "id": f"chatcmpl-fallback-{uuid.uuid4().hex}",
+                    "object": "chat.completion.chunk",
+                    "created": int(os.path.getmtime(__file__)),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": detector.content_buffer}}]
+                }
+                yield f"data: {json.dumps(content_chunk)}\n\n".encode('utf-8')
 
     elif detector.state == "detecting" and detector.content_buffer:
         # If stream has ended but buffer still has remaining characters insufficient to form signal, output them
@@ -1655,7 +1685,15 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
             "choices": [{"index": 0, "delta": {"content": detector.content_buffer}}]
         }
         yield f"data: {json.dumps(final_yield_chunk)}\n\n".encode('utf-8')
-
+    
+    stop_chunk = {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion.chunk",
+        "created": int(os.path.getmtime(__file__)),
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    }
+    yield f"data: {json.dumps(stop_chunk)}\n\n".encode('utf-8')
     yield b"data: [DONE]\n\n"
 
 
