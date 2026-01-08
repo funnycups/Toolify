@@ -1365,6 +1365,7 @@ async def chat_completions(
             completion_tokens = 0
             completion_text = ""
             done_received = False
+            stream_id = None  # Keep all streamed chunks under the same id (OpenAI-compatible)
             upstream_usage_chunk = None  # Store upstream usage chunk if any
             
             async for chunk in stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, GLOBAL_TRIGGER_SIGNAL):
@@ -1378,6 +1379,9 @@ async def chat_completions(
                             break
                         elif line_data:
                             chunk_json = json.loads(line_data)
+
+                            if stream_id is None and isinstance(chunk_json, dict):
+                                stream_id = chunk_json.get("id")
                             
                             # Check if this chunk contains usage information
                             if "usage" in chunk_json:
@@ -1455,7 +1459,7 @@ async def chat_completions(
             # Send usage information only if requested via stream_options.include_usage
             if body.stream_options and body.stream_options.get("include_usage", False):
                 usage_chunk_to_send = {
-                    "id": f"chatcmpl-{uuid.uuid4().hex}",
+                    "id": (upstream_usage_chunk.get("id") if isinstance(upstream_usage_chunk, dict) else None) or stream_id or f"chatcmpl-{uuid.uuid4().hex}",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": body.model,
