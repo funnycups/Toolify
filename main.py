@@ -1387,10 +1387,11 @@ async def chat_completions(
                             if "usage" in chunk_json:
                                 upstream_usage_chunk = chunk_json
                                 logger.debug(f"🔧 Detected upstream usage data in chunk")
-                                # Only suppress usage-only chunks (choices missing or empty)
                                 if not ("choices" in chunk_json and len(chunk_json["choices"]) > 0):
-                                    # Don't yield upstream usage-only chunk now; we'll handle usage later
                                     continue
+                                else:
+                                    chunk_json = {k: v for k, v in chunk_json.items() if k != "usage"}
+                                    chunk = f"data: {json.dumps(chunk_json)}\n\n".encode('utf-8')
                             
                             # Process regular content chunks
                             if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
