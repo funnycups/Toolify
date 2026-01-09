@@ -1458,11 +1458,18 @@ async def chat_completions(
                         if prefix_text == "":
                             prefix_text = None
 
-                    response_json["choices"][0]["message"] = {
+                    # Preserve extra fields from upstream message (e.g., reasoning_content, refusal, audio, annotations)
+                    original_message = response_json["choices"][0]["message"]
+                    new_message = {
                         "role": "assistant",
                         "content": prefix_text,
                         "tool_calls": tool_calls,
                     }
+                    # Copy over any extra fields that upstream returned
+                    for key in original_message:
+                        if key not in ["role", "content", "tool_calls"]:
+                            new_message[key] = original_message[key]
+                    response_json["choices"][0]["message"] = new_message
                     response_json["choices"][0]["finish_reason"] = "tool_calls"
                     logger.debug(f"🔧 Function call conversion completed")
                 else:
@@ -1854,7 +1861,19 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                         chunk_json = json.loads(line_data)
                         delta = chunk_json.get("choices", [{}])[0].get("delta", {})
                         delta_content = delta.get("content", "") or ""
+                        delta_reasoning = delta.get("reasoning_content", "") or ""
                         finish_reason = chunk_json.get("choices", [{}])[0].get("finish_reason")
+                        
+                        # Forward reasoning_content directly (it's not part of function call detection)
+                        if delta_reasoning:
+                            reasoning_chunk = {
+                                "id": chunk_json.get("id") or f"chatcmpl-passthrough-{uuid.uuid4().hex}",
+                                "object": "chat.completion.chunk",
+                                "created": chunk_json.get("created") or int(os.path.getmtime(__file__)),
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"reasoning_content": delta_reasoning}}]
+                            }
+                            yield f"data: {json.dumps(reasoning_chunk)}\n\n".encode('utf-8')
                         
                         if delta_content:
                             is_detected, content_to_yield = detector.process_chunk(delta_content)
