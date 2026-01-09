@@ -735,13 +735,23 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
     
     logger.debug(f"🔧 Found {len(signal_positions)} trigger signal positions: {signal_positions}")
     
-    last_signal_pos = signal_positions[-1]
-    content_after_signal = cleaned_content[last_signal_pos:]
-    logger.debug(f"🔧 Content starting from last trigger signal: {repr(content_after_signal[:100])}")
-    
-    calls_content_match = re.search(r"<function_calls>([\s\S]*?)</function_calls>", content_after_signal)
-    if not calls_content_match:
-        logger.debug(f"🔧 No function_calls tag found")
+    chosen_signal_index = None
+    chosen_signal_pos = None
+    calls_content_match = None
+
+    for idx in range(len(signal_positions) - 1, -1, -1):
+        pos = signal_positions[idx]
+        sub = cleaned_content[pos:]
+        m = re.search(r"<function_calls>([\s\S]*?)</function_calls>", sub)
+        if m:
+            chosen_signal_index = idx
+            chosen_signal_pos = pos
+            calls_content_match = m
+            logger.debug(f"🔧 Using trigger signal index {idx} at pos {pos}; content preview: {repr(sub[:100])}")
+            break
+
+    if calls_content_match is None:
+        logger.debug(f"🔧 No function_calls tag found after any trigger signal (triggers={len(signal_positions)})")
         return None
 
     calls_xml = calls_content_match.group(0)
