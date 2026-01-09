@@ -62,6 +62,25 @@ features:
   #   Your custom prompt template here...
   #   Must include {tools_list} and {trigger_signal} placeholders
 
+  # Function calling error retry configuration
+  # When enabled, if the model outputs an invalid function call format,
+  # the system will send the error details back to the model and ask it to retry.
+  enable_fc_error_retry: false       # Enable automatic retry for function call parsing errors (default: false)
+  fc_error_retry_max_attempts: 3     # Maximum retry attempts (1-10, default: 3)
+  
+  # Custom error retry prompt template (optional). If not provided, the default prompt will be used.
+  # Must contain {error_details} and {original_response} placeholders.
+  # fc_error_retry_prompt_template: |
+  #   Your previous response attempted to make a function call but the format was invalid.
+  #   
+  #   **Your original response:**
+  #   {original_response}
+  #   
+  #   **Error details:**
+  #   {error_details}
+  #   
+  #   Please retry and output the function call in the correct XML format as instructed. DO NOT OUTPUT ANYTHING ELSE.
+
 # Configuration explanation:
 # 1. upstream_services: Configure multiple OpenAI compatible API services
 #    - name: Service name (for identification)

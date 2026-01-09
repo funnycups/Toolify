@@ -230,6 +230,155 @@ def build_tool_call_index_from_messages(messages: List[Dict[str, Any]]) -> Dict[
     logger.debug(f"🔧 Built tool_call index with {len(index)} entries")
     return index
 
+def get_fc_error_retry_prompt(original_response: str, error_details: str) -> str:
+    custom_template = app_config.features.fc_error_retry_prompt_template
+    if custom_template:
+        return custom_template.format(
+            original_response=original_response,
+            error_details=error_details
+        )
+    
+    return f"""Your previous response attempted to make a function call but the format was invalid or could not be parsed.
+
+**Your original response:**
+```
+{original_response}
+```
+
+**Error details:**
+{error_details}
+
+**Instructions:**
+Please retry and output the function call in the correct XML format. Remember:
+1. Start with the trigger signal on its own line
+2. Immediately follow with the <function_calls> XML block
+3. Use <args_json> with valid JSON for parameters
+4. Do not add any text after </function_calls>
+
+Please provide the corrected function call now. DO NOT OUTPUT ANYTHING ELSE."""
+
+
+async def attempt_fc_parse_with_retry(
+    content: str,
+    trigger_signal: str,
+    messages: List[Dict[str, Any]],
+    upstream_url: str,
+    headers: Dict[str, str],
+    model: str,
+    timeout: int
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Attempt to parse function calls from content. If parsing fails and retry is enabled,
+    send error details back to the model for correction.
+    
+    Returns parsed tool calls or None if parsing ultimately fails.
+    """
+    if not app_config.features.enable_fc_error_retry:
+        return parse_function_calls_xml(content, trigger_signal)
+    
+    max_attempts = app_config.features.fc_error_retry_max_attempts
+    current_content = content
+    current_messages = messages.copy()
+    
+    for attempt in range(max_attempts):
+        parsed_tools = parse_function_calls_xml(current_content, trigger_signal)
+        
+        if parsed_tools:
+            if attempt > 0:
+                logger.info(f"✅ Function call parsing succeeded on retry attempt {attempt + 1}")
+            return parsed_tools
+        
+        if trigger_signal not in current_content:
+            logger.debug(f"🔧 No trigger signal found in response, not a function call attempt")
+            return None
+        
+        if attempt >= max_attempts - 1:
+            logger.warning(f"⚠️ Function call parsing failed after {max_attempts} attempts")
+            return None
+        
+        error_details = _diagnose_fc_parse_error(current_content, trigger_signal)
+        retry_prompt = get_fc_error_retry_prompt(current_content, error_details)
+        
+        logger.info(f"🔄 Function call parsing failed, attempting retry {attempt + 2}/{max_attempts}")
+        logger.debug(f"🔧 Error details: {error_details}")
+        
+        retry_messages = current_messages + [
+            {"role": "assistant", "content": current_content},
+            {"role": "user", "content": retry_prompt}
+        ]
+        
+        try:
+            retry_response = await http_client.post(
+                upstream_url,
+                json={"model": model, "messages": retry_messages, "stream": False},
+                headers=headers,
+                timeout=timeout
+            )
+            retry_response.raise_for_status()
+            retry_json = retry_response.json()
+            
+            if retry_json.get("choices") and len(retry_json["choices"]) > 0:
+                current_content = retry_json["choices"][0].get("message", {}).get("content", "")
+                current_messages = retry_messages
+                logger.debug(f"🔧 Received retry response, length: {len(current_content)}")
+            else:
+                logger.warning(f"⚠️ Retry response has no valid choices")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Retry request failed: {e}")
+            return None
+    
+    return None
+
+
+def _diagnose_fc_parse_error(content: str, trigger_signal: str) -> str:
+    """Diagnose why function call parsing failed and return error description."""
+    errors = []
+    
+    if trigger_signal not in content:
+        errors.append(f"Trigger signal '{trigger_signal[:30]}...' not found in response")
+        return "; ".join(errors)
+    
+    cleaned = remove_think_blocks(content)
+    
+    if "<function_calls>" not in cleaned:
+        errors.append("Missing <function_calls> tag after trigger signal")
+    elif "</function_calls>" not in cleaned:
+        errors.append("Missing closing </function_calls> tag")
+    
+    if "<function_call>" not in cleaned:
+        errors.append("No <function_call> blocks found inside <function_calls>")
+    elif "</function_call>" not in cleaned:
+        errors.append("Missing closing </function_call> tag")
+    
+    fc_match = re.search(r"<function_calls>([\s\S]*?)</function_calls>", cleaned)
+    if fc_match:
+        fc_content = fc_match.group(1)
+        
+        if "<tool>" not in fc_content:
+            errors.append("Missing <tool> tag inside function_call")
+        
+        if "<args_json>" not in fc_content and "<args>" not in fc_content:
+            errors.append("Missing <args_json> or <args> tag inside function_call")
+        
+        args_json_match = re.search(r"<args_json>([\s\S]*?)</args_json>", fc_content)
+        if args_json_match:
+            args_content = args_json_match.group(1).strip()
+            cdata_match = re.search(r"<!\[CDATA\[([\s\S]*?)\]\]>", args_content)
+            json_to_parse = cdata_match.group(1) if cdata_match else args_content
+            
+            try:
+                json.loads(json_to_parse)
+            except json.JSONDecodeError as e:
+                errors.append(f"Invalid JSON in args_json: {str(e)}")
+    
+    if not errors:
+        errors.append("XML structure appears correct but parsing failed for unknown reason")
+    
+    return "; ".join(errors)
+
+
 def format_tool_result_for_ai(tool_name: str, tool_arguments: str, result_content: str) -> str:
     """
     Format tool call results for AI understanding with complete context.
@@ -1272,7 +1421,15 @@ async def chat_completions(
                 content = response_json["choices"][0]["message"]["content"]
                 logger.debug(f"🔧 Complete response content: {repr(content)}")
                 
-                parsed_tools = parse_function_calls_xml(content, GLOBAL_TRIGGER_SIGNAL)
+                parsed_tools = await attempt_fc_parse_with_retry(
+                    content=content,
+                    trigger_signal=GLOBAL_TRIGGER_SIGNAL,
+                    messages=request_body_dict["messages"],
+                    upstream_url=upstream_url,
+                    headers=headers,
+                    model=actual_model,
+                    timeout=app_config.server.timeout
+                )
                 logger.debug(f"🔧 XML parsing result: {parsed_tools}")
                 
                 if parsed_tools:
@@ -1378,7 +1535,7 @@ async def chat_completions(
             stream_id = None  # Keep all streamed chunks under the same id (OpenAI-compatible)
             upstream_usage_chunk = None  # Store upstream usage chunk if any
             
-            async for chunk in stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, GLOBAL_TRIGGER_SIGNAL):
+            async for chunk in stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, GLOBAL_TRIGGER_SIGNAL, request_body_dict["messages"]):
                 # Check if this is the [DONE] marker
                 if chunk.startswith(b"data: "):
                     try:
@@ -1496,7 +1653,68 @@ async def chat_completions(
             media_type="text/event-stream"
         )
 
-async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, model: str, has_fc: bool, trigger_signal: str):
+async def _attempt_streaming_fc_retry(
+    original_content: str,
+    trigger_signal: str,
+    messages: List[Dict[str, Any]],
+    url: str,
+    headers: Dict[str, str],
+    model: str,
+    timeout: int
+) -> Optional[List[Dict[str, Any]]]:
+    max_attempts = app_config.features.fc_error_retry_max_attempts
+    current_content = original_content
+    current_messages = messages.copy()
+    
+    for attempt in range(max_attempts):
+        if attempt == 0:
+            parsed_tools = parse_function_calls_xml(current_content, trigger_signal)
+            if parsed_tools:
+                return parsed_tools
+        
+        if attempt >= max_attempts - 1:
+            logger.warning(f"⚠️ Streaming FC retry failed after {max_attempts} attempts")
+            return None
+        
+        error_details = _diagnose_fc_parse_error(current_content, trigger_signal)
+        retry_prompt = get_fc_error_retry_prompt(current_content, error_details)
+        
+        logger.info(f"🔄 Streaming FC retry attempt {attempt + 2}/{max_attempts}")
+        
+        retry_messages = current_messages + [
+            {"role": "assistant", "content": current_content},
+            {"role": "user", "content": retry_prompt}
+        ]
+        
+        try:
+            retry_response = await http_client.post(
+                url,
+                json={"model": model, "messages": retry_messages, "stream": False},
+                headers=headers,
+                timeout=timeout
+            )
+            retry_response.raise_for_status()
+            retry_json = retry_response.json()
+            
+            if retry_json.get("choices") and len(retry_json["choices"]) > 0:
+                current_content = retry_json["choices"][0].get("message", {}).get("content", "")
+                current_messages = retry_messages
+                
+                parsed_tools = parse_function_calls_xml(current_content, trigger_signal)
+                if parsed_tools:
+                    return parsed_tools
+            else:
+                logger.warning(f"⚠️ Streaming FC retry response has no valid choices")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Streaming FC retry request failed: {e}")
+            return None
+    
+    return None
+
+
+async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, model: str, has_fc: bool, trigger_signal: str, original_messages: Optional[List[Dict[str, Any]]] = None):
     """
     Enhanced streaming proxy, supports dynamic trigger signals, avoids misjudgment within think tags
     """
@@ -1588,12 +1806,31 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                             yield sse.encode('utf-8')
                                         return
                                     else:
-                                        logger.warning(
-                                            "⚠️ Early finalize detected </function_calls> but failed to parse tool calls; "
-                                            "silently ending stream. buffer_len=%s preview=%r",
-                                            len(detector.content_buffer),
-                                            detector.content_buffer[:200],
-                                        )
+                                        if app_config.features.enable_fc_error_retry and original_messages:
+                                            logger.info(f"🔄 Early finalize FC parsing failed, attempting retry...")
+                                            retry_parsed = await _attempt_streaming_fc_retry(
+                                                original_content=detector.content_buffer,
+                                                trigger_signal=trigger_signal,
+                                                messages=original_messages,
+                                                url=url,
+                                                headers=headers,
+                                                model=model,
+                                                timeout=app_config.server.timeout
+                                            )
+                                            if retry_parsed:
+                                                logger.info(f"✅ Early finalize FC retry succeeded, parsed {len(retry_parsed)} tool calls")
+                                                for sse in _build_tool_call_sse_chunks(retry_parsed, model):
+                                                    yield sse.encode('utf-8')
+                                                return
+                                            else:
+                                                logger.warning(f"⚠️ Early finalize FC retry also failed, ending stream")
+                                        else:
+                                            logger.warning(
+                                                "⚠️ Early finalize detected </function_calls> but failed to parse tool calls; "
+                                                "silently ending stream. buffer_len=%s preview=%r",
+                                                len(detector.content_buffer),
+                                                detector.content_buffer[:200],
+                                            )
                                         stop_chunk = {
                                             "id": f"chatcmpl-{uuid.uuid4().hex}",
                                             "object": "chat.completion.chunk",
@@ -1666,17 +1903,35 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
         if parsed_tools:
             logger.debug(f"🔧 Streaming processing: Successfully parsed {len(parsed_tools)} tool calls")
             for sse in _build_tool_call_sse_chunks(parsed_tools, model):
-                # Ensure we always yield bytes to keep stream_with_token_count() stable
                 yield sse.encode("utf-8")
             return
         else:
-            logger.warning(
-                "⚠️ Detected tool call signal but XML parsing failed; outputting accumulated text. "
-                "buffer_len=%s preview=%r",
-                len(detector.content_buffer),
-                detector.content_buffer[:300],
-            )
-            # Output the accumulated content if any
+            if app_config.features.enable_fc_error_retry and original_messages:
+                logger.info(f"🔄 Streaming FC parsing failed, attempting retry with error correction...")
+                retry_parsed = await _attempt_streaming_fc_retry(
+                    original_content=detector.content_buffer,
+                    trigger_signal=trigger_signal,
+                    messages=original_messages,
+                    url=url,
+                    headers=headers,
+                    model=model,
+                    timeout=app_config.server.timeout
+                )
+                if retry_parsed:
+                    logger.info(f"✅ Streaming FC retry succeeded, parsed {len(retry_parsed)} tool calls")
+                    for sse in _build_tool_call_sse_chunks(retry_parsed, model):
+                        yield sse.encode("utf-8")
+                    return
+                else:
+                    logger.warning(f"⚠️ Streaming FC retry also failed, falling back to text output")
+            else:
+                logger.warning(
+                    "⚠️ Detected tool call signal but XML parsing failed; outputting accumulated text. "
+                    "buffer_len=%s preview=%r",
+                    len(detector.content_buffer),
+                    detector.content_buffer[:300],
+                )
+            
             if detector.content_buffer:
                 content_chunk = {
                     "id": f"chatcmpl-fallback-{uuid.uuid4().hex}",

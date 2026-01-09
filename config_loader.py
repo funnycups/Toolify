@@ -70,6 +70,11 @@ class FeaturesConfig(BaseModel):
     prompt_template: Optional[str] = Field(default=None, description="Custom prompt template for function calling")
     key_passthrough: bool = Field(default=False, description="If true, directly forward client-provided API key to upstream instead of using configured upstream key")
     model_passthrough: bool = Field(default=False, description="If true, forward all requests directly to the 'openai' upstream service, ignoring model-based routing")
+    
+    # Function calling error retry configuration
+    enable_fc_error_retry: bool = Field(default=False, description="Enable automatic retry when function call parsing fails")
+    fc_error_retry_max_attempts: int = Field(default=3, ge=1, le=10, description="Maximum number of retry attempts for function call error correction")
+    fc_error_retry_prompt_template: Optional[str] = Field(default=None, description="Custom prompt template for function call error correction. Must contain {error_details} and {original_response} placeholders if provided.")
 
     @field_validator('log_level')
     def validate_log_level(cls, v):
@@ -83,6 +88,13 @@ class FeaturesConfig(BaseModel):
         if v:
             if "{tools_list}" not in v or "{trigger_signal}" not in v:
                 raise ValueError("prompt_template must contain {tools_list} and {trigger_signal} placeholders")
+        return v
+
+    @field_validator('fc_error_retry_prompt_template')
+    def validate_fc_error_retry_prompt_template(cls, v):
+        if v:
+            if "{error_details}" not in v or "{original_response}" not in v:
+                raise ValueError("fc_error_retry_prompt_template must contain {error_details} and {original_response} placeholders")
         return v
 
 
