@@ -16,6 +16,8 @@ Toolify is a middleware proxy designed to inject OpenAI-compatible function call
 - **Multi-Service Routing**: Routes requests to different upstream services based on the requested model name.
 - **Client Authentication**: Secures the middleware with configurable client API keys.
 - **Enhanced Context Awareness**: When tool results are provided (role=`tool`), Toolify includes the tool name and arguments (derived from the request's conversation history) alongside the execution results for better upstream context.
+- **Token Counting**: Provides accurate token usage statistics in responses, including support for`reasoning_content`tokens.
+- **Automatic Retry**: Automatically provides error information and requests the model to retry when function call parsing fails, enhancing reliability.
 
 ## How It Works
 
@@ -110,9 +112,11 @@ Refer to [`config.example.yaml`](config.example.yaml) for detailed configuration
   - Define `base_url`, `api_key`, supported `models`, and set one service as `is_default: true`.
 - **`client_authentication`**: List of `allowed_keys` for clients accessing this middleware.
 - **`features`**: Toggle features like logging, role conversion, and API key handling.
-  - `key_passthrough`: Set to `true` to directly forward the client-provided API key to the upstream service, bypassing the configured `api_key` in `upstream_services`.
-  - `model_passthrough`: Set to `true` to forward all requests directly to the upstream service named 'openai', ignoring any model-based routing rules.
+  - `key_passthrough`: Set to`true`to directly forward the client-provided API key to the upstream service, bypassing the configured`api_key`in`upstream_services`.
+  - `model_passthrough`: Set to`true`to forward all requests directly to the upstream service named 'openai', ignoring any model-based routing rules.
   - `prompt_template`: Customize the system prompt used to instruct the model on how to use tools.
+  - `enable_fc_error_retry`: Set to`true`to enable automatic retry when function call parsing fails.
+  - `fc_error_retry_max_attempts`: Maximum retry attempts (1-10, default: 3).
 
 ## Usage
 
