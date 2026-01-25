@@ -1557,6 +1557,13 @@ async def chat_completions(
                             if stream_id is None and isinstance(chunk_json, dict):
                                 stream_id = chunk_json.get("id")
                             
+                            if chunk_json.get("object") == "chat.completion.chunk.internal":
+                                raw_fc_content = chunk_json.get("_internal_fc_raw_content", "")
+                                if raw_fc_content:
+                                    completion_text += raw_fc_content
+                                    logger.debug(f"🔧 Received internal FC raw content for token counting: {len(raw_fc_content)} chars")
+                                continue
+                            
                             # Check if this chunk contains usage information
                             if "usage" in chunk_json:
                                 upstream_usage_chunk = chunk_json
@@ -1750,9 +1757,16 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
             })
         return tool_calls
 
-    def _build_tool_call_sse_chunks(parsed_tools: List[Dict[str, Any]], model_id: str) -> List[str]:
+    def _build_tool_call_sse_chunks(parsed_tools: List[Dict[str, Any]], model_id: str, raw_content: str = "") -> List[str]:
         tool_calls = _prepare_tool_calls(parsed_tools)
         chunks: List[str] = []
+
+        if raw_content:
+            metadata_chunk = {
+                "object": "chat.completion.chunk.internal",
+                "_internal_fc_raw_content": raw_content
+            }
+            chunks.append(f"data: {json.dumps(metadata_chunk)}\n\n")
 
         initial_chunk = {
             "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
@@ -1809,7 +1823,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                     parsed_tools = detector.finalize()
                                     if parsed_tools:
                                         logger.debug(f"🔧 Early finalize: parsed {len(parsed_tools)} tool calls")
-                                        for sse in _build_tool_call_sse_chunks(parsed_tools, model):
+                                        for sse in _build_tool_call_sse_chunks(parsed_tools, model, detector.content_buffer):
                                             yield sse.encode('utf-8')
                                         return
                                     else:
@@ -1826,7 +1840,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                             )
                                             if retry_parsed:
                                                 logger.info(f"✅ Early finalize FC retry succeeded, parsed {len(retry_parsed)} tool calls")
-                                                for sse in _build_tool_call_sse_chunks(retry_parsed, model):
+                                                for sse in _build_tool_call_sse_chunks(retry_parsed, model, detector.content_buffer):
                                                     yield sse.encode('utf-8')
                                                 return
                                             else:
@@ -1921,7 +1935,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
         parsed_tools = detector.finalize()
         if parsed_tools:
             logger.debug(f"🔧 Streaming processing: Successfully parsed {len(parsed_tools)} tool calls")
-            for sse in _build_tool_call_sse_chunks(parsed_tools, model):
+            for sse in _build_tool_call_sse_chunks(parsed_tools, model, detector.content_buffer):
                 yield sse.encode("utf-8")
             return
         else:
@@ -1938,7 +1952,7 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                 )
                 if retry_parsed:
                     logger.info(f"✅ Streaming FC retry succeeded, parsed {len(retry_parsed)} tool calls")
-                    for sse in _build_tool_call_sse_chunks(retry_parsed, model):
+                    for sse in _build_tool_call_sse_chunks(retry_parsed, model, detector.content_buffer):
                         yield sse.encode("utf-8")
                     return
                 else:
