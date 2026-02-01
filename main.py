@@ -258,6 +258,205 @@ Please retry and output the function call in the correct XML format. Remember:
 Please provide the corrected function call now. DO NOT OUTPUT ANYTHING ELSE."""
 
 
+def _schema_type_name(v: Any) -> str:
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, int) and not isinstance(v, bool):
+        return "integer"
+    if isinstance(v, float):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    return type(v).__name__
+
+
+def _validate_value_against_schema(value: Any, schema: Dict[str, Any], path: str = "args", depth: int = 0) -> List[str]:
+    """Best-effort JSON Schema validation for tool arguments.
+
+    Intentional subset:
+    - type, properties, required, additionalProperties
+    - items (array)
+    - enum, const
+    - anyOf/oneOf/allOf (basic)
+    - pattern/minLength/maxLength (string)
+
+    Returns a list of human-readable errors.
+    """
+    if schema is None:
+        schema = {}
+    if depth > 8:
+        return []  # prevent pathological recursion
+
+    errors: List[str] = []
+
+    # Combinators
+    if isinstance(schema.get("allOf"), list):
+        for idx, sub in enumerate(schema["allOf"]):
+            errors.extend(_validate_value_against_schema(value, sub or {}, f"{path}.allOf[{idx}]", depth + 1))
+        return errors
+
+    if isinstance(schema.get("anyOf"), list):
+        option_errors = [
+            _validate_value_against_schema(value, sub or {}, path, depth + 1)
+            for sub in schema["anyOf"]
+        ]
+        if not any(len(e) == 0 for e in option_errors):
+            errors.append(f"{path}: value does not satisfy anyOf options")
+        return errors
+
+    if isinstance(schema.get("oneOf"), list):
+        option_errors = [
+            _validate_value_against_schema(value, sub or {}, path, depth + 1)
+            for sub in schema["oneOf"]
+        ]
+        ok_count = sum(1 for e in option_errors if len(e) == 0)
+        if ok_count != 1:
+            errors.append(f"{path}: value must satisfy exactly one oneOf option (matched {ok_count})")
+        return errors
+
+    # enum/const
+    if "const" in schema:
+        if value != schema.get("const"):
+            errors.append(f"{path}: expected const={schema.get('const')!r}, got {value!r}")
+            return errors
+
+    enum_vals = schema.get("enum")
+    if isinstance(enum_vals, list):
+        if value not in enum_vals:
+            errors.append(f"{path}: expected one of {enum_vals!r}, got {value!r}")
+            return errors
+
+    stype = schema.get("type")
+    if stype is None:
+        # If schema omits type but has object keywords, treat as object.
+        if any(k in schema for k in ("properties", "required", "additionalProperties")):
+            stype = "object"
+
+    # type checks
+    def _type_ok(t: str) -> bool:
+        if t == "object":
+            return isinstance(value, dict)
+        if t == "array":
+            return isinstance(value, list)
+        if t == "string":
+            return isinstance(value, str)
+        if t == "boolean":
+            return isinstance(value, bool)
+        if t == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if t == "number":
+            return (isinstance(value, (int, float)) and not isinstance(value, bool))
+        if t == "null":
+            return value is None
+        return True
+
+    if isinstance(stype, str):
+        if not _type_ok(stype):
+            errors.append(f"{path}: expected type '{stype}', got '{_schema_type_name(value)}'")
+            return errors
+    elif isinstance(stype, list):
+        if not any(_type_ok(t) for t in stype if isinstance(t, str)):
+            errors.append(f"{path}: expected type in {stype!r}, got '{_schema_type_name(value)}'")
+            return errors
+
+    # string constraints
+    if isinstance(value, str):
+        min_len = schema.get("minLength")
+        max_len = schema.get("maxLength")
+        if isinstance(min_len, int) and len(value) < min_len:
+            errors.append(f"{path}: string shorter than minLength={min_len}")
+        if isinstance(max_len, int) and len(value) > max_len:
+            errors.append(f"{path}: string longer than maxLength={max_len}")
+        pat = schema.get("pattern")
+        if isinstance(pat, str):
+            try:
+                if re.search(pat, value) is None:
+                    errors.append(f"{path}: string does not match pattern {pat!r}")
+            except re.error:
+                # ignore invalid patterns in schema
+                pass
+
+    # object
+    if isinstance(value, dict):
+        props = schema.get("properties")
+        if props is None:
+            props = {}
+        if not isinstance(props, dict):
+            props = {}
+        required = schema.get("required")
+        if required is None:
+            required = []
+        if not isinstance(required, list):
+            required = []
+        required = [k for k in required if isinstance(k, str)]
+
+        for k in required:
+            if k not in value:
+                errors.append(f"{path}: missing required property '{k}'")
+
+        additional = schema.get("additionalProperties", True)
+
+        for k, v in value.items():
+            if k in props:
+                errors.extend(_validate_value_against_schema(v, props.get(k) or {}, f"{path}.{k}", depth + 1))
+            else:
+                if additional is False:
+                    errors.append(f"{path}: unexpected property '{k}'")
+                elif isinstance(additional, dict):
+                    errors.extend(_validate_value_against_schema(v, additional, f"{path}.{k}", depth + 1))
+
+    # array
+    if isinstance(value, list):
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for i, v in enumerate(value):
+                errors.extend(_validate_value_against_schema(v, items, f"{path}[{i}]", depth + 1))
+
+    return errors
+
+
+def validate_parsed_tools(parsed_tools: List[Dict[str, Any]], tools: List["Tool"]) -> Optional[str]:
+    """Validate parsed tool calls against declared tools definitions.
+
+    Returns a single error string if invalid, else None.
+    """
+    tools = tools or []
+    allowed = {t.function.name: (t.function.parameters or {}) for t in tools if t and t.function and t.function.name}
+    allowed_names = sorted(list(allowed.keys()))
+
+    for idx, call in enumerate(parsed_tools or []):
+        name = (call or {}).get("name")
+        args = (call or {}).get("args")
+
+        if not isinstance(name, str) or not name:
+            return f"Tool call #{idx + 1}: missing tool name"
+
+        if name not in allowed:
+            return (
+                f"Tool call #{idx + 1}: unknown tool '{name}'. "
+                f"Allowed tools: {allowed_names}"
+            )
+
+        if not isinstance(args, dict):
+            return f"Tool call #{idx + 1} '{name}': arguments must be a JSON object, got {_schema_type_name(args)}"
+
+        schema = allowed[name] or {}
+        errs = _validate_value_against_schema(args, schema, path=f"{name}")
+        if errs:
+            # Keep message short but actionable
+            preview = "; ".join(errs[:6])
+            more = f" (+{len(errs) - 6} more)" if len(errs) > 6 else ""
+            return f"Tool call #{idx + 1} '{name}': schema validation failed: {preview}{more}"
+
+    return None
+
+
 async def attempt_fc_parse_with_retry(
     content: str,
     trigger_signal: str,
@@ -265,6 +464,7 @@ async def attempt_fc_parse_with_retry(
     upstream_url: str,
     headers: Dict[str, str],
     model: str,
+    tools: List["Tool"],
     timeout: int
 ) -> Optional[List[Dict[str, Any]]]:
     """
@@ -273,30 +473,44 @@ async def attempt_fc_parse_with_retry(
     
     Returns parsed tool calls or None if parsing ultimately fails.
     """
+    def _parse_and_validate(current_content: str) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        parsed = parse_function_calls_xml(current_content, trigger_signal)
+        if not parsed:
+            return None, None
+        validation_error = validate_parsed_tools(parsed, tools)
+        if validation_error:
+            return None, validation_error
+        return parsed, None
+
     if not app_config.features.enable_fc_error_retry:
-        return parse_function_calls_xml(content, trigger_signal)
+        parsed, _err = _parse_and_validate(content)
+        return parsed
     
     max_attempts = app_config.features.fc_error_retry_max_attempts
     current_content = content
     current_messages = messages.copy()
     
     for attempt in range(max_attempts):
-        parsed_tools = parse_function_calls_xml(current_content, trigger_signal)
-        
+        parsed_tools, validation_error = _parse_and_validate(current_content)
+
         if parsed_tools:
             if attempt > 0:
                 logger.info(f"✅ Function call parsing succeeded on retry attempt {attempt + 1}")
             return parsed_tools
         
-        if trigger_signal not in current_content:
-            logger.debug(f"🔧 No trigger signal found in response, not a function call attempt")
+        # IMPORTANT: only treat this as a tool-call attempt if the trigger signal appears
+        # outside of  blocks. Otherwise models that mention the trigger
+        # inside think can spuriously trigger retries.
+        if find_last_trigger_signal_outside_think(current_content, trigger_signal) == -1:
+            logger.debug("🔧 No trigger signal found outside <think> blocks; not a function call attempt")
             return None
         
         if attempt >= max_attempts - 1:
             logger.warning(f"⚠️ Function call parsing failed after {max_attempts} attempts")
             return None
         
-        error_details = _diagnose_fc_parse_error(current_content, trigger_signal)
+        # If parsing succeeded but tool/schema validation failed, report semantic errors.
+        error_details = validation_error or _diagnose_fc_parse_error(current_content, trigger_signal)
         retry_prompt = get_fc_error_retry_prompt(current_content, error_details)
         
         logger.info(f"🔄 Function call parsing failed, attempting retry {attempt + 2}/{max_attempts}")
@@ -369,7 +583,9 @@ def _diagnose_fc_parse_error(content: str, trigger_signal: str) -> str:
             json_to_parse = cdata_match.group(1) if cdata_match else args_content
             
             try:
-                json.loads(json_to_parse)
+                parsed = json.loads(json_to_parse)
+                if not isinstance(parsed, dict):
+                    errors.append(f"args_json must be a JSON object, got {type(parsed).__name__}")
             except json.JSONDecodeError as e:
                 errors.append(f"Invalid JSON in args_json: {str(e)}")
     
@@ -415,14 +631,24 @@ def format_assistant_tool_calls_for_ai(tool_calls: List[Dict[str, Any]], trigger
     for tool_call in tool_calls:
         function_info = tool_call.get("function", {})
         name = function_info.get("name", "")
-        arguments_json = function_info.get("arguments", "{}")
-        
+        arguments_val = function_info.get("arguments", "{}")
+
+        # Strict: assistant.tool_calls must carry JSON-object arguments (or a JSON string representing an object).
         try:
-            # First, try to load as JSON. If it's a string that's a valid JSON, we parse it.
-            args_dict = json.loads(arguments_json)
-        except (json.JSONDecodeError, TypeError):
-            # If it's not a valid JSON string, treat it as a simple string.
-            args_dict = {"raw_arguments": arguments_json}
+            if isinstance(arguments_val, dict):
+                args_dict = arguments_val
+            elif isinstance(arguments_val, str):
+                parsed = json.loads(arguments_val or "{}")
+                if not isinstance(parsed, dict):
+                    raise ValueError(f"arguments must be a JSON object, got {type(parsed).__name__}")
+                args_dict = parsed
+            else:
+                raise ValueError(f"arguments must be a JSON object or JSON string, got {type(arguments_val).__name__}")
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid assistant.tool_calls arguments for tool '{name}': {e}"
+            )
 
         args_payload = json.dumps(args_dict, ensure_ascii=False)
         xml_call = (
@@ -913,7 +1139,13 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
         except Exception:
             return v
 
-    def _parse_args_json_payload(payload: str) -> Dict[str, Any]:
+    def _parse_args_json_payload(payload: str) -> Optional[Dict[str, Any]]:
+        """Strict args_json parsing.
+
+        - Empty payload -> {}
+        - Must be valid JSON and MUST decode to an object (dict)
+        - Any invalid / non-object payload -> None (treated as parse failure)
+        """
         if payload is None:
             return {}
         s = payload.strip()
@@ -921,11 +1153,13 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
             return {}
         try:
             parsed = json.loads(s)
-            if isinstance(parsed, dict):
-                return parsed
-            return {"raw_arguments": parsed}
-        except Exception:
-            return {"raw_arguments": s}
+        except Exception as e:
+            logger.debug(f"🔧 Invalid JSON in args_json: {type(e).__name__}: {e}")
+            return None
+        if not isinstance(parsed, dict):
+            logger.debug(f"🔧 args_json must decode to an object, got {type(parsed).__name__}")
+            return None
+        return parsed
 
     def _extract_cdata_text(raw: str) -> str:
         if raw is None:
@@ -951,7 +1185,11 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
 
             args_json_el = fc.find("args_json")
             if args_json_el is not None:
-                args = _parse_args_json_payload(args_json_el.text or "")
+                parsed_args = _parse_args_json_payload(args_json_el.text or "")
+                if parsed_args is None:
+                    logger.debug(f"🔧 Invalid args_json in function_call #{i+1}; treating as parse failure")
+                    return None
+                args = parsed_args
             else:
                 # Legacy fallback: <args><k>json</k></args>
                 args_el = fc.find("args")
@@ -987,7 +1225,11 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
         if args_json_match:
             raw_payload = args_json_match.group(1)
             payload = _extract_cdata_text(raw_payload)
-            args = _parse_args_json_payload(payload)
+            parsed_args = _parse_args_json_payload(payload)
+            if parsed_args is None:
+                logger.debug(f"🔧 Invalid args_json in function_call #{i+1} (regex path); treating as parse failure")
+                return None
+            args = parsed_args
         else:
             # Legacy fallback
             args_block_match = re.search(r"<args>([\s\S]*?)</args>", block)
@@ -1307,10 +1549,11 @@ async def chat_completions(
 
     if has_function_call:
         logger.debug(f"🔧 Using global trigger signal for this request: {GLOBAL_TRIGGER_SIGNAL}")
+
+        tools_for_request: List[Tool] = body.tools or []
+        function_prompt, _ = generate_function_prompt(tools_for_request, GLOBAL_TRIGGER_SIGNAL)
         
-        function_prompt, _ = generate_function_prompt(body.tools, GLOBAL_TRIGGER_SIGNAL)
-        
-        tool_choice_prompt = safe_process_tool_choice(body.tool_choice, body.tools)
+        tool_choice_prompt = safe_process_tool_choice(body.tool_choice, tools_for_request)
         if tool_choice_prompt:
             function_prompt += tool_choice_prompt
 
@@ -1428,6 +1671,7 @@ async def chat_completions(
                     upstream_url=upstream_url,
                     headers=headers,
                     model=actual_model,
+                    tools=body.tools or [],
                     timeout=app_config.server.timeout
                 )
                 logger.debug(f"🔧 XML parsing result: {parsed_tools}")
@@ -1542,7 +1786,16 @@ async def chat_completions(
             stream_id = None  # Keep all streamed chunks under the same id (OpenAI-compatible)
             upstream_usage_chunk = None  # Store upstream usage chunk if any
             
-            async for chunk in stream_proxy_with_fc_transform(upstream_url, request_body_dict, headers, body.model, has_function_call, GLOBAL_TRIGGER_SIGNAL, request_body_dict["messages"]):
+            async for chunk in stream_proxy_with_fc_transform(
+                upstream_url,
+                request_body_dict,
+                headers,
+                body.model,
+                has_function_call,
+                GLOBAL_TRIGGER_SIGNAL,
+                request_body_dict["messages"],
+                tools=body.tools or [],
+            ):
                 # Check if this is the [DONE] marker
                 if chunk.startswith(b"data: "):
                     try:
@@ -1674,15 +1927,33 @@ async def _attempt_streaming_fc_retry(
     url: str,
     headers: Dict[str, str],
     model: str,
-    timeout: int
+    timeout: int,
+    tools: Optional[List["Tool"]] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     max_attempts = app_config.features.fc_error_retry_max_attempts
     current_content = original_content
     current_messages = messages.copy()
+
+    def _parse_and_validate(current_content: str) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        parsed = parse_function_calls_xml(current_content, trigger_signal)
+        if not parsed:
+            return None, None
+        validation_error = validate_parsed_tools(parsed, tools or [])
+        if validation_error:
+            return None, validation_error
+        return parsed, None
     
+    validation_error: Optional[str] = None
+
     for attempt in range(max_attempts):
+        # Same rule as non-streaming: avoid retrying if the trigger only appears inside <think>.
+        if find_last_trigger_signal_outside_think(current_content, trigger_signal) == -1:
+            logger.debug("🔧 Streaming retry: no trigger signal found outside <think> blocks; aborting retry")
+            return None
+
+        validation_error = None
         if attempt == 0:
-            parsed_tools = parse_function_calls_xml(current_content, trigger_signal)
+            parsed_tools, validation_error = _parse_and_validate(current_content)
             if parsed_tools:
                 return parsed_tools
         
@@ -1690,7 +1961,8 @@ async def _attempt_streaming_fc_retry(
             logger.warning(f"⚠️ Streaming FC retry failed after {max_attempts} attempts")
             return None
         
-        error_details = _diagnose_fc_parse_error(current_content, trigger_signal)
+        # If parsing succeeded but tool/schema validation failed, report semantic errors.
+        error_details = validation_error or _diagnose_fc_parse_error(current_content, trigger_signal)
         retry_prompt = get_fc_error_retry_prompt(current_content, error_details)
         
         logger.info(f"🔄 Streaming FC retry attempt {attempt + 2}/{max_attempts}")
@@ -1714,7 +1986,7 @@ async def _attempt_streaming_fc_retry(
                 current_content = retry_json["choices"][0].get("message", {}).get("content", "")
                 current_messages = retry_messages
                 
-                parsed_tools = parse_function_calls_xml(current_content, trigger_signal)
+                parsed_tools, validation_error = _parse_and_validate(current_content)
                 if parsed_tools:
                     return parsed_tools
             else:
@@ -1728,7 +2000,16 @@ async def _attempt_streaming_fc_retry(
     return None
 
 
-async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, model: str, has_fc: bool, trigger_signal: str, original_messages: Optional[List[Dict[str, Any]]] = None):
+async def stream_proxy_with_fc_transform(
+    url: str,
+    body: dict,
+    headers: dict,
+    model: str,
+    has_fc: bool,
+    trigger_signal: str,
+    original_messages: Optional[List[Dict[str, Any]]] = None,
+    tools: Optional[List["Tool"]] = None,
+):
     """
     Enhanced streaming proxy, supports dynamic trigger signals, avoids misjudgment within think tags
     """
@@ -1744,7 +2025,6 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
             logger.debug("🔧 Upstream closed connection prematurely, ending stream response")
             return
         return
-# setattr()``
     detector = StreamingFunctionCallDetector(trigger_signal)
 
     def _prepare_tool_calls(parsed_tools: List[Dict[str, Any]]):
@@ -1822,6 +2102,12 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                     logger.debug("🔧 Detected </function_calls> in stream, finalizing early...")
                                     parsed_tools = detector.finalize()
                                     if parsed_tools:
+                                        validation_error = validate_parsed_tools(parsed_tools, tools or [])
+                                        if validation_error:
+                                            logger.info(f"🔧 Tool/schema validation failed in stream finalize: {validation_error}")
+                                            parsed_tools = None
+
+                                    if parsed_tools:
                                         logger.debug(f"🔧 Early finalize: parsed {len(parsed_tools)} tool calls")
                                         for sse in _build_tool_call_sse_chunks(parsed_tools, model, detector.content_buffer):
                                             yield sse.encode('utf-8')
@@ -1836,7 +2122,8 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                                                 url=url,
                                                 headers=headers,
                                                 model=model,
-                                                timeout=app_config.server.timeout
+                                                timeout=app_config.server.timeout,
+                                                tools=tools,
                                             )
                                             if retry_parsed:
                                                 logger.info(f"✅ Early finalize FC retry succeeded, parsed {len(retry_parsed)} tool calls")
@@ -1934,6 +2221,12 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
         logger.debug(f"🔧 Stream ended, starting to parse tool call XML...")
         parsed_tools = detector.finalize()
         if parsed_tools:
+            validation_error = validate_parsed_tools(parsed_tools, tools or [])
+            if validation_error:
+                logger.info(f"🔧 Tool/schema validation failed at stream end: {validation_error}")
+                parsed_tools = None
+
+        if parsed_tools:
             logger.debug(f"🔧 Streaming processing: Successfully parsed {len(parsed_tools)} tool calls")
             for sse in _build_tool_call_sse_chunks(parsed_tools, model, detector.content_buffer):
                 yield sse.encode("utf-8")
@@ -1948,7 +2241,8 @@ async def stream_proxy_with_fc_transform(url: str, body: dict, headers: dict, mo
                     url=url,
                     headers=headers,
                     model=model,
-                    timeout=app_config.server.timeout
+                    timeout=app_config.server.timeout,
+                    tools=tools,
                 )
                 if retry_parsed:
                     logger.info(f"✅ Streaming FC retry succeeded, parsed {len(retry_parsed)} tool calls")
