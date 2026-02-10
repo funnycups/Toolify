@@ -693,11 +693,11 @@ When you need to use tools, you **MUST** strictly follow this format. Do NOT inc
 
 1. When starting tool calls, begin on a new line with exactly:
 {trigger_signal}
-No leading or trailing spaces, output exactly as shown above. The trigger signal MUST be on its own line and appear only once.
+No leading or trailing spaces, output exactly as shown above. The trigger signal MUST be on its own line and appear only once. Do not output a trigger signal for each tool call.
 
 2. Starting from the second line, **immediately** follow with the complete <function_calls> XML block.
 
-3. For multiple tool calls, include multiple <function_call> blocks within the same <function_calls> wrapper.
+3. For multiple tool calls, include multiple <function_call> blocks within the same <function_calls> wrapper, not separate blocks. Output the trigger signal only once, then one <function_calls> with all <function_call> children.
 
 4. Do not add any text or explanation after the closing </function_calls> tag.
 
