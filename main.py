@@ -720,7 +720,7 @@ CORRECT Example (multiple tool calls):
         <tool>search</tool>
         <args_json><![CDATA[{{"keywords": ["Python Document", "how to use python"]}}]]></args_json>
     </function_call>
-  </function_calls>
+</function_calls>
 
 INCORRECT Example (extra text + wrong key names — DO NOT DO THIS):
 ...response content (optional)...
