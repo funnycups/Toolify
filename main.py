@@ -2026,6 +2026,15 @@ async def stream_proxy_with_fc_transform(
             return
         return
     detector = StreamingFunctionCallDetector(trigger_signal)
+    stream_id = None
+    pending_finish_reason = None
+
+    def _ensure_stream_id(chunk_json: Optional[Dict[str, Any]] = None) -> str:
+        nonlocal stream_id
+        if stream_id is None:
+            upstream_id = chunk_json.get("id") if isinstance(chunk_json, dict) else None
+            stream_id = upstream_id or f"chatcmpl-passthrough-{uuid.uuid4().hex}"
+        return stream_id
 
     def _prepare_tool_calls(parsed_tools: List[Dict[str, Any]]):
         tool_calls = []
@@ -2040,6 +2049,7 @@ async def stream_proxy_with_fc_transform(
     def _build_tool_call_sse_chunks(parsed_tools: List[Dict[str, Any]], model_id: str, raw_content: str = "") -> List[str]:
         tool_calls = _prepare_tool_calls(parsed_tools)
         chunks: List[str] = []
+        current_stream_id = _ensure_stream_id()
 
         if raw_content:
             metadata_chunk = {
@@ -2049,7 +2059,7 @@ async def stream_proxy_with_fc_transform(
             chunks.append(f"data: {json.dumps(metadata_chunk)}\n\n")
 
         initial_chunk = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
+            "id": current_stream_id, "object": "chat.completion.chunk",
             "created": int(os.path.getmtime(__file__)), "model": model_id,
             "choices": [{"index": 0, "delta": {"role": "assistant", "content": None, "tool_calls": tool_calls}, "finish_reason": None}],
         }
@@ -2057,7 +2067,7 @@ async def stream_proxy_with_fc_transform(
 
 
         final_chunk = {
-             "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
+             "id": current_stream_id, "object": "chat.completion.chunk",
             "created": int(os.path.getmtime(__file__)), "model": model_id,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
         }
@@ -2095,6 +2105,7 @@ async def stream_proxy_with_fc_transform(
                         if line_data and line_data != "[DONE]":
                             try:
                                 chunk_json = json.loads(line_data)
+                                _ensure_stream_id(chunk_json)
                                 delta_content = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "") or ""
                                 detector.content_buffer += delta_content
                                 # Early termination: once </function_calls> appears, parse and finish immediately
@@ -2140,7 +2151,7 @@ async def stream_proxy_with_fc_transform(
                                                 detector.content_buffer[:200],
                                             )
                                         stop_chunk = {
-                                            "id": f"chatcmpl-{uuid.uuid4().hex}",
+                                            "id": _ensure_stream_id(chunk_json),
                                             "object": "chat.completion.chunk",
                                             "created": int(os.path.getmtime(__file__)),
                                             "model": model,
@@ -2160,6 +2171,7 @@ async def stream_proxy_with_fc_transform(
                     
                     try:
                         chunk_json = json.loads(line_data)
+                        current_stream_id = _ensure_stream_id(chunk_json)
                         delta = chunk_json.get("choices", [{}])[0].get("delta", {})
                         delta_content = delta.get("content", "") or ""
                         delta_reasoning = delta.get("reasoning_content", "") or ""
@@ -2168,7 +2180,7 @@ async def stream_proxy_with_fc_transform(
                         # Forward reasoning_content directly (it's not part of function call detection)
                         if delta_reasoning:
                             reasoning_chunk = {
-                                "id": chunk_json.get("id") or f"chatcmpl-passthrough-{uuid.uuid4().hex}",
+                                "id": current_stream_id,
                                 "object": "chat.completion.chunk",
                                 "created": chunk_json.get("created") or int(os.path.getmtime(__file__)),
                                 "model": model,
@@ -2181,7 +2193,7 @@ async def stream_proxy_with_fc_transform(
                             
                             if content_to_yield:
                                 yield_chunk = {
-                                    "id": f"chatcmpl-passthrough-{uuid.uuid4().hex}",
+                                    "id": current_stream_id,
                                     "object": "chat.completion.chunk",
                                     "created": int(os.path.getmtime(__file__)),
                                     "model": model,
@@ -2193,15 +2205,9 @@ async def stream_proxy_with_fc_transform(
                                 # Tool call signal detected, switch to parsing mode
                                 continue
                         
-                        if finish_reason:
-                            finish_chunk = {
-                                "id": chunk_json.get("id") or f"chatcmpl-passthrough-{uuid.uuid4().hex}",
-                                "object": "chat.completion.chunk",
-                                "created": chunk_json.get("created") or int(os.path.getmtime(__file__)),
-                                "model": model,
-                                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
-                            }
-                            yield f"data: {json.dumps(finish_chunk)}\n\n".encode('utf-8')
+                        if finish_reason and pending_finish_reason is None:
+                            # Defer finish until all buffered content is flushed.
+                            pending_finish_reason = finish_reason
                     
                     except (json.JSONDecodeError, IndexError):
                         # Ensure we always yield bytes to keep stream_with_token_count() stable
@@ -2261,7 +2267,7 @@ async def stream_proxy_with_fc_transform(
             
             if detector.content_buffer:
                 content_chunk = {
-                    "id": f"chatcmpl-fallback-{uuid.uuid4().hex}",
+                    "id": _ensure_stream_id(),
                     "object": "chat.completion.chunk",
                     "created": int(os.path.getmtime(__file__)),
                     "model": model,
@@ -2272,18 +2278,18 @@ async def stream_proxy_with_fc_transform(
     elif detector.state == "detecting" and detector.content_buffer:
         # If stream has ended but buffer still has remaining characters insufficient to form signal, output them
         final_yield_chunk = {
-            "id": f"chatcmpl-finalflush-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
+            "id": _ensure_stream_id(), "object": "chat.completion.chunk",
             "created": int(os.path.getmtime(__file__)), "model": model,
             "choices": [{"index": 0, "delta": {"content": detector.content_buffer}}]
         }
         yield f"data: {json.dumps(final_yield_chunk)}\n\n".encode('utf-8')
     
     stop_chunk = {
-        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "id": _ensure_stream_id(),
         "object": "chat.completion.chunk",
         "created": int(os.path.getmtime(__file__)),
         "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        "choices": [{"index": 0, "delta": {}, "finish_reason": pending_finish_reason or "stop"}]
     }
     yield f"data: {json.dumps(stop_chunk)}\n\n".encode('utf-8')
     yield b"data: [DONE]\n\n"
