@@ -2030,6 +2030,22 @@ async def stream_proxy_with_fc_transform(
     pending_finish_reason = None
     early_finalize_retry_attempted = False
 
+    def _looks_like_complete_function_calls(buf: str) -> bool:
+        if not buf:
+            return False
+        if "<function_calls>" not in buf or "</function_calls>" not in buf:
+            return False
+        # Basic tag balance checks to avoid parsing partial stream fragments.
+        if buf.count("<function_call>") != buf.count("</function_call>"):
+            return False
+        # args_json may be optional, but if present must be balanced.
+        if ("<args_json>" in buf or "</args_json>" in buf) and buf.count("<args_json>") != buf.count("</args_json>"):
+            return False
+        # CDATA sections must be balanced if present.
+        if ("<![CDATA[" in buf or "]]>" in buf) and buf.count("<![CDATA[") != buf.count("]]>"):
+            return False
+        return True
+
     def _ensure_stream_id(chunk_json: Optional[Dict[str, Any]] = None) -> str:
         nonlocal stream_id
         if stream_id is None:
@@ -2111,7 +2127,15 @@ async def stream_proxy_with_fc_transform(
                                 detector.content_buffer += delta_content
                                 # Early termination: once </function_calls> appears, parse and finish immediately
                                 if "</function_calls>" in detector.content_buffer:
-                                    logger.debug("🔧 Detected </function_calls> in stream, finalizing early...")
+                                    if not _looks_like_complete_function_calls(detector.content_buffer):
+                                        logger.debug(
+                                            "🔧 Detected </function_calls> but content seems incomplete; keep buffering. "
+                                            "buffer_len=%s tail=%r",
+                                            len(detector.content_buffer),
+                                            detector.content_buffer[-160:],
+                                        )
+                                        continue
+                                    logger.debug("🔧 Detected </function_calls> in stream with complete tag balance, finalizing early...")
                                     parsed_tools = detector.finalize()
                                     if parsed_tools:
                                         validation_error = validate_parsed_tools(parsed_tools, tools or [])
