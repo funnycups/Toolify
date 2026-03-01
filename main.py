@@ -2028,6 +2028,7 @@ async def stream_proxy_with_fc_transform(
     detector = StreamingFunctionCallDetector(trigger_signal)
     stream_id = None
     pending_finish_reason = None
+    early_finalize_retry_attempted = False
 
     def _ensure_stream_id(chunk_json: Optional[Dict[str, Any]] = None) -> str:
         nonlocal stream_id
@@ -2124,8 +2125,11 @@ async def stream_proxy_with_fc_transform(
                                             yield sse.encode('utf-8')
                                         return
                                     else:
-                                        if app_config.features.enable_fc_error_retry and original_messages:
-                                            logger.info(f"🔄 Early finalize FC parsing failed, attempting retry...")
+                                        # Do NOT terminate immediately on early parse failure.
+                                        # In streaming, chunks may still be arriving.
+                                        if app_config.features.enable_fc_error_retry and original_messages and not early_finalize_retry_attempted:
+                                            early_finalize_retry_attempted = True
+                                            logger.info(f"🔄 Early finalize FC parsing failed, attempting retry (once)...")
                                             retry_parsed = await _attempt_streaming_fc_retry(
                                                 original_content=detector.content_buffer,
                                                 trigger_signal=trigger_signal,
@@ -2142,24 +2146,20 @@ async def stream_proxy_with_fc_transform(
                                                     yield sse.encode('utf-8')
                                                 return
                                             else:
-                                                logger.warning(f"⚠️ Early finalize FC retry also failed, ending stream")
+                                                logger.warning(
+                                                    "⚠️ Early finalize FC retry failed; continue buffering until stream end. "
+                                                    "buffer_len=%s preview=%r",
+                                                    len(detector.content_buffer),
+                                                    detector.content_buffer[:200],
+                                                )
                                         else:
                                             logger.warning(
                                                 "⚠️ Early finalize detected </function_calls> but failed to parse tool calls; "
-                                                "silently ending stream. buffer_len=%s preview=%r",
+                                                "continue buffering until stream end. buffer_len=%s preview=%r",
                                                 len(detector.content_buffer),
                                                 detector.content_buffer[:200],
                                             )
-                                        stop_chunk = {
-                                            "id": _ensure_stream_id(chunk_json),
-                                            "object": "chat.completion.chunk",
-                                            "created": int(os.path.getmtime(__file__)),
-                                            "model": model,
-                                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                                        }
-                                        yield f"data: {json.dumps(stop_chunk)}\n\n".encode('utf-8')
-                                        yield b"data: [DONE]\n\n"
-                                        return
+                                        continue
                             except (json.JSONDecodeError, IndexError):
                                 pass
                     continue
