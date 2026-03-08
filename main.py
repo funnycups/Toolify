@@ -1140,34 +1140,92 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
             return v
 
     def _parse_args_json_payload(payload: str) -> Optional[Dict[str, Any]]:
-        """Strict args_json parsing.
+        """Robust args_json parsing.
 
         - Empty payload -> {}
-        - Must be valid JSON and MUST decode to an object (dict)
-        - Any invalid / non-object payload -> None (treated as parse failure)
+        - Must decode to a JSON object (dict)
+        - Includes light recovery for malformed/truncated wrappers
         """
         if payload is None:
             return {}
         s = payload.strip()
         if not s:
             return {}
-        try:
-            parsed = json.loads(s)
-        except Exception as e:
-            logger.debug(f"🔧 Invalid JSON in args_json: {type(e).__name__}: {e}")
-            return None
-        if not isinstance(parsed, dict):
-            logger.debug(f"🔧 args_json must decode to an object, got {type(parsed).__name__}")
-            return None
-        return parsed
+
+        # Remove accidental markdown fences if model emits them
+        if s.startswith("```"):
+            s = re.sub(r"^```(?:json)?\s*", "", s)
+            s = re.sub(r"\s*```$", "", s)
+
+        def _try_parse(x: str):
+            try:
+                y = json.loads(x)
+                return y if isinstance(y, dict) else None
+            except Exception:
+                return None
+
+        parsed = _try_parse(s)
+        if parsed is not None:
+            return parsed
+
+        # Recovery 1: extract a balanced JSON object only if the full payload
+        # consists of that object with optional surrounding whitespace.
+        start = s.find("{")
+        if start != -1:
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(s)):
+                ch = s[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                else:
+                    if ch == '"':
+                        in_str = True
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            candidate = s[start:i+1]
+                            if s[:start].strip() or s[i+1:].strip():
+                                logger.debug("🔧 args_json recovery rejected due to leading/trailing content outside JSON object")
+                                break
+                            parsed = _try_parse(candidate)
+                            if parsed is not None:
+                                logger.debug("🔧 args_json recovered via balanced-object extraction")
+                                return parsed
+                            break
+
+        logger.debug("🔧 Invalid args_json in function_call payload after recovery attempts")
+        return None
 
     def _extract_cdata_text(raw: str) -> str:
         if raw is None:
             return ""
+        # No CDATA wrapper, return raw as-is
         if "<![CDATA[" not in raw:
             return raw
+
+        # Join split CDATA sections safely, e.g. ]]]]><![CDATA[>
         parts = re.findall(r"<!\[CDATA\[(.*?)\]\]>", raw, flags=re.DOTALL)
-        return "".join(parts) if parts else raw
+        if parts:
+            return "".join(parts)
+
+        # Unterminated CDATA is treated as invalid to preserve fail-closed behavior.
+        st = raw.find("<![CDATA[")
+        if st != -1:
+            st += len("<![CDATA[")
+            ed = raw.rfind("]]>")
+            if ed > st:
+                return raw[st:ed]
+            return ""
+        return raw
 
     results: List[Dict[str, Any]] = []
 
@@ -1221,9 +1279,11 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
         name = tool_match.group(1).strip()
         args: Dict[str, Any] = {}
 
-        args_json_match = re.search(r"<args_json>([\s\S]*?)</args_json>", block)
-        if args_json_match:
-            raw_payload = args_json_match.group(1)
+        # Tolerant args_json extraction (handles split CDATA and multiline payloads)
+        args_json_open = block.find("<args_json>")
+        args_json_close = block.find("</args_json>")
+        if args_json_open != -1 and args_json_close != -1 and args_json_close > args_json_open:
+            raw_payload = block[args_json_open + len("<args_json>"):args_json_close]
             payload = _extract_cdata_text(raw_payload)
             parsed_args = _parse_args_json_payload(payload)
             if parsed_args is None:
