@@ -7,6 +7,7 @@ import os
 import re
 import json
 import uuid
+import asyncio
 import httpx
 import secrets
 import string
@@ -522,11 +523,11 @@ async def attempt_fc_parse_with_retry(
         ]
         
         try:
-            retry_response = await http_client.post(
+            retry_response = await _post_upstream_with_retry(
                 upstream_url,
-                json={"model": model, "messages": retry_messages, "stream": False},
-                headers=headers,
-                timeout=timeout
+                {"model": model, "messages": retry_messages, "stream": False},
+                headers,
+                timeout,
             )
             retry_response.raise_for_status()
             retry_json = retry_response.json()
@@ -1355,6 +1356,43 @@ def find_upstream(model_name: str) -> tuple[Dict[str, Any], str]:
 app = FastAPI()
 http_client = httpx.AsyncClient()
 
+UPSTREAM_RETRY_ATTEMPTS = 3
+UPSTREAM_RETRY_BASE_DELAY_SECONDS = 0.5
+
+
+def _is_retriable_upstream_error(exc: Exception) -> bool:
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
+def _get_upstream_retry_delay(attempt: int) -> float:
+    return UPSTREAM_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+
+
+async def _post_upstream_with_retry(url: str, json_body: dict, headers: Dict[str, str], timeout: int) -> httpx.Response:
+    last_error: Optional[Exception] = None
+
+    for attempt in range(UPSTREAM_RETRY_ATTEMPTS):
+        try:
+            return await http_client.post(url, json=json_body, headers=headers, timeout=timeout)
+        except Exception as exc:
+            last_error = exc
+            if not _is_retriable_upstream_error(exc) or attempt >= UPSTREAM_RETRY_ATTEMPTS - 1:
+                raise
+
+            delay = _get_upstream_retry_delay(attempt)
+            logger.warning(
+                "⚠️ Upstream POST failed with %s; retrying in %.1fs (%s/%s)",
+                type(exc).__name__,
+                delay,
+                attempt + 2,
+                UPSTREAM_RETRY_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Unreachable upstream retry state")
+
 @app.middleware("http")
 async def debug_middleware(request: Request, call_next):
     """Middleware for debugging validation errors, does not log conversation content."""
@@ -1650,8 +1688,8 @@ async def chat_completions(
             logger.debug(f"🔧 has_function_call: {has_function_call}")
             logger.debug(f"🔧 Request body contains tools: {bool(body.tools)}")
             
-            upstream_response = await http_client.post(
-                upstream_url, json=request_body_dict, headers=headers, timeout=app_config.server.timeout
+            upstream_response = await _post_upstream_with_retry(
+                upstream_url, request_body_dict, headers, app_config.server.timeout
             )
             upstream_response.raise_for_status() # If status code is 4xx or 5xx, raise exception
             
@@ -2033,11 +2071,11 @@ async def _attempt_streaming_fc_retry(
         ]
         
         try:
-            retry_response = await http_client.post(
+            retry_response = await _post_upstream_with_retry(
                 url,
-                json={"model": model, "messages": retry_messages, "stream": False},
-                headers=headers,
-                timeout=timeout
+                {"model": model, "messages": retry_messages, "stream": False},
+                headers,
+                timeout,
             )
             retry_response.raise_for_status()
             retry_json = retry_response.json()
@@ -2077,13 +2115,29 @@ async def stream_proxy_with_fc_transform(
     logger.info(f"📝 Function calling enabled: {has_fc}")
 
     if not has_fc or not trigger_signal:
-        try:
-            async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
-                async for chunk in response.aiter_bytes():
-                    yield chunk
-        except httpx.RemoteProtocolError:
-            logger.debug("🔧 Upstream closed connection prematurely, ending stream response")
-            return
+        streamed_any_output = False
+        for attempt in range(UPSTREAM_RETRY_ATTEMPTS):
+            try:
+                async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
+                    async for chunk in response.aiter_bytes():
+                        streamed_any_output = True
+                        yield chunk
+                return
+            except httpx.RemoteProtocolError:
+                logger.debug("🔧 Upstream closed connection prematurely, ending stream response")
+                return
+            except Exception as exc:
+                if streamed_any_output or not _is_retriable_upstream_error(exc) or attempt >= UPSTREAM_RETRY_ATTEMPTS - 1:
+                    raise
+                delay = _get_upstream_retry_delay(attempt)
+                logger.warning(
+                    "⚠️ Upstream stream failed with %s; retrying in %.1fs (%s/%s)",
+                    type(exc).__name__,
+                    delay,
+                    attempt + 2,
+                    UPSTREAM_RETRY_ATTEMPTS,
+                )
+                await asyncio.sleep(delay)
         return
     detector = StreamingFunctionCallDetector(trigger_signal)
     stream_id = None
@@ -2152,150 +2206,178 @@ async def stream_proxy_with_fc_transform(
         chunks.append("data: [DONE]\n\n")
         return chunks
 
+    streamed_any_output = False
+
     try:
-        async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
-            if response.status_code != 200:
-                error_content = await response.aread()
-                logger.error(f"❌ Upstream service stream response error: status_code={response.status_code}")
-                logger.error(f"❌ Upstream error details: {error_content.decode('utf-8', errors='ignore')}")
-                
-                if response.status_code == 401:
-                    error_message = "Authentication failed"
-                elif response.status_code == 403:
-                    error_message = "Access forbidden"
-                elif response.status_code == 429:
-                    error_message = "Rate limit exceeded"
-                elif response.status_code >= 500:
-                    error_message = "Upstream service temporarily unavailable"
-                else:
-                    error_message = "Request processing failed"
-                
-                error_chunk = {"error": {"message": error_message, "type": "upstream_error"}}
-                yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
-                yield b"data: [DONE]\n\n"
-                return
+        for attempt in range(UPSTREAM_RETRY_ATTEMPTS):
+            try:
+                async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
+                    if response.status_code != 200:
+                        error_content = await response.aread()
+                        logger.error(f"❌ Upstream service stream response error: status_code={response.status_code}")
+                        logger.error(f"❌ Upstream error details: {error_content.decode('utf-8', errors='ignore')}")
+                        
+                        if response.status_code == 401:
+                            error_message = "Authentication failed"
+                        elif response.status_code == 403:
+                            error_message = "Access forbidden"
+                        elif response.status_code == 429:
+                            error_message = "Rate limit exceeded"
+                        elif response.status_code >= 500:
+                            error_message = "Upstream service temporarily unavailable"
+                        else:
+                            error_message = "Request processing failed"
+                        
+                        error_chunk = {"error": {"message": error_message, "type": "upstream_error"}}
+                        yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+                        yield b"data: [DONE]\n\n"
+                        return
 
-            async for line in response.aiter_lines():
-                if detector.state == "tool_parsing":
-                    if line.startswith("data:"):
-                        line_data = line[len("data: "):].strip()
-                        if line_data and line_data != "[DONE]":
-                            try:
-                                chunk_json = json.loads(line_data)
-                                _ensure_stream_id(chunk_json)
-                                delta_content = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "") or ""
-                                detector.content_buffer += delta_content
-                                # Early termination: once </function_calls> appears, parse and finish immediately
-                                if "</function_calls>" in detector.content_buffer:
-                                    if not _looks_like_complete_function_calls(detector.content_buffer):
-                                        logger.debug(
-                                            "🔧 Detected </function_calls> but content seems incomplete; keep buffering. "
-                                            "buffer_len=%s tail=%r",
-                                            len(detector.content_buffer),
-                                            detector.content_buffer[-160:],
-                                        )
-                                        continue
-                                    logger.debug("🔧 Detected </function_calls> in stream with complete tag balance, finalizing early...")
-                                    parsed_tools = detector.finalize()
-                                    if parsed_tools:
-                                        validation_error = validate_parsed_tools(parsed_tools, tools or [])
-                                        if validation_error:
-                                            logger.info(f"🔧 Tool/schema validation failed in stream finalize: {validation_error}")
-                                            parsed_tools = None
+                    async for line in response.aiter_lines():
+                        if detector.state == "tool_parsing":
+                            if line.startswith("data:"):
+                                line_data = line[len("data: "):].strip()
+                                if line_data and line_data != "[DONE]":
+                                    try:
+                                        chunk_json = json.loads(line_data)
+                                        _ensure_stream_id(chunk_json)
+                                        delta_content = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "") or ""
+                                        detector.content_buffer += delta_content
+                                        # Early termination: once </function_calls> appears, parse and finish immediately
+                                        if "</function_calls>" in detector.content_buffer:
+                                            if not _looks_like_complete_function_calls(detector.content_buffer):
+                                                logger.debug(
+                                                    "🔧 Detected </function_calls> but content seems incomplete; keep buffering. "
+                                                    "buffer_len=%s tail=%r",
+                                                    len(detector.content_buffer),
+                                                    detector.content_buffer[-160:],
+                                                )
+                                                continue
+                                            logger.debug("🔧 Detected </function_calls> in stream with complete tag balance, finalizing early...")
+                                            parsed_tools = detector.finalize()
+                                            if parsed_tools:
+                                                validation_error = validate_parsed_tools(parsed_tools, tools or [])
+                                                if validation_error:
+                                                    logger.info(f"🔧 Tool/schema validation failed in stream finalize: {validation_error}")
+                                                    parsed_tools = None
 
-                                    if parsed_tools:
-                                        logger.debug(f"🔧 Early finalize: parsed {len(parsed_tools)} tool calls")
-                                        for sse in _build_tool_call_sse_chunks(parsed_tools, model, detector.content_buffer):
-                                            yield sse.encode('utf-8')
-                                        return
-                                    else:
-                                        # Do NOT terminate immediately on early parse failure.
-                                        # In streaming, chunks may still be arriving.
-                                        if app_config.features.enable_fc_error_retry and original_messages and not early_finalize_retry_attempted:
-                                            early_finalize_retry_attempted = True
-                                            logger.info(f"🔄 Early finalize FC parsing failed, attempting retry (once)...")
-                                            retry_parsed = await _attempt_streaming_fc_retry(
-                                                original_content=detector.content_buffer,
-                                                trigger_signal=trigger_signal,
-                                                messages=original_messages,
-                                                url=url,
-                                                headers=headers,
-                                                model=model,
-                                                timeout=app_config.server.timeout,
-                                                tools=tools,
-                                            )
-                                            if retry_parsed:
-                                                logger.info(f"✅ Early finalize FC retry succeeded, parsed {len(retry_parsed)} tool calls")
-                                                for sse in _build_tool_call_sse_chunks(retry_parsed, model, detector.content_buffer):
+                                            if parsed_tools:
+                                                logger.debug(f"🔧 Early finalize: parsed {len(parsed_tools)} tool calls")
+                                                for sse in _build_tool_call_sse_chunks(parsed_tools, model, detector.content_buffer):
+                                                    streamed_any_output = True
                                                     yield sse.encode('utf-8')
                                                 return
                                             else:
-                                                logger.warning(
-                                                    "⚠️ Early finalize FC retry failed; continue buffering until stream end. "
-                                                    "buffer_len=%s preview=%r",
-                                                    len(detector.content_buffer),
-                                                    detector.content_buffer[:200],
-                                                )
-                                        else:
-                                            logger.warning(
-                                                "⚠️ Early finalize detected </function_calls> but failed to parse tool calls; "
-                                                "continue buffering until stream end. buffer_len=%s preview=%r",
-                                                len(detector.content_buffer),
-                                                detector.content_buffer[:200],
-                                            )
-                                        continue
-                            except (json.JSONDecodeError, IndexError):
-                                pass
-                    continue
-                
-                if line.startswith("data:"):
-                    line_data = line[len("data: "):].strip()
-                    if not line_data or line_data == "[DONE]":
-                        continue
-                    
-                    try:
-                        chunk_json = json.loads(line_data)
-                        current_stream_id = _ensure_stream_id(chunk_json)
-                        delta = chunk_json.get("choices", [{}])[0].get("delta", {})
-                        delta_content = delta.get("content", "") or ""
-                        delta_reasoning = delta.get("reasoning_content", "") or ""
-                        finish_reason = chunk_json.get("choices", [{}])[0].get("finish_reason")
+                                                # Do NOT terminate immediately on early parse failure.
+                                                # In streaming, chunks may still be arriving.
+                                                if app_config.features.enable_fc_error_retry and original_messages and not early_finalize_retry_attempted:
+                                                    early_finalize_retry_attempted = True
+                                                    logger.info(f"🔄 Early finalize FC parsing failed, attempting retry (once)...")
+                                                    retry_parsed = await _attempt_streaming_fc_retry(
+                                                        original_content=detector.content_buffer,
+                                                        trigger_signal=trigger_signal,
+                                                        messages=original_messages,
+                                                        url=url,
+                                                        headers=headers,
+                                                        model=model,
+                                                        timeout=app_config.server.timeout,
+                                                        tools=tools,
+                                                    )
+                                                    if retry_parsed:
+                                                        logger.info(f"✅ Early finalize FC retry succeeded, parsed {len(retry_parsed)} tool calls")
+                                                        for sse in _build_tool_call_sse_chunks(retry_parsed, model, detector.content_buffer):
+                                                            streamed_any_output = True
+                                                            yield sse.encode('utf-8')
+                                                        return
+                                                    else:
+                                                        logger.warning(
+                                                            "⚠️ Early finalize FC retry failed; continue buffering until stream end. "
+                                                            "buffer_len=%s preview=%r",
+                                                            len(detector.content_buffer),
+                                                            detector.content_buffer[:200],
+                                                        )
+                                                else:
+                                                    logger.warning(
+                                                        "⚠️ Early finalize detected </function_calls> but failed to parse tool calls; "
+                                                        "continue buffering until stream end. buffer_len=%s preview=%r",
+                                                        len(detector.content_buffer),
+                                                        detector.content_buffer[:200],
+                                                    )
+                                                continue
+                                    except (json.JSONDecodeError, IndexError):
+                                        pass
+                            continue
                         
-                        # Forward reasoning_content directly (it's not part of function call detection)
-                        if delta_reasoning:
-                            reasoning_chunk = {
-                                "id": current_stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": chunk_json.get("created") or int(os.path.getmtime(__file__)),
-                                "model": model,
-                                "choices": [{"index": 0, "delta": {"reasoning_content": delta_reasoning}}]
-                            }
-                            yield f"data: {json.dumps(reasoning_chunk)}\n\n".encode('utf-8')
-                        
-                        if delta_content:
-                            is_detected, content_to_yield = detector.process_chunk(delta_content)
-                            
-                            if content_to_yield:
-                                yield_chunk = {
-                                    "id": current_stream_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": int(os.path.getmtime(__file__)),
-                                    "model": model,
-                                    "choices": [{"index": 0, "delta": {"content": content_to_yield}}]
-                                }
-                                yield f"data: {json.dumps(yield_chunk)}\n\n".encode('utf-8')
-                            
-                            if is_detected:
-                                # Tool call signal detected, switch to parsing mode
+                        if line.startswith("data:"):
+                            line_data = line[len("data: "):].strip()
+                            if not line_data or line_data == "[DONE]":
                                 continue
-                        
-                        if finish_reason and pending_finish_reason is None:
-                            # Defer finish until all buffered content is flushed.
-                            pending_finish_reason = finish_reason
-                    
-                    except (json.JSONDecodeError, IndexError):
-                        # Ensure we always yield bytes to keep stream_with_token_count() stable
-                        yield (line + "\n\n").encode("utf-8")
+                            
+                            try:
+                                chunk_json = json.loads(line_data)
+                                current_stream_id = _ensure_stream_id(chunk_json)
+                                delta = chunk_json.get("choices", [{}])[0].get("delta", {})
+                                delta_content = delta.get("content", "") or ""
+                                delta_reasoning = delta.get("reasoning_content", "") or ""
+                                finish_reason = chunk_json.get("choices", [{}])[0].get("finish_reason")
+                                
+                                # Forward reasoning_content directly (it's not part of function call detection)
+                                if delta_reasoning:
+                                    reasoning_chunk = {
+                                        "id": current_stream_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": chunk_json.get("created") or int(os.path.getmtime(__file__)),
+                                        "model": model,
+                                        "choices": [{"index": 0, "delta": {"reasoning_content": delta_reasoning}}]
+                                    }
+                                    streamed_any_output = True
+                                    yield f"data: {json.dumps(reasoning_chunk)}\n\n".encode('utf-8')
+                                
+                                if delta_content:
+                                    is_detected, content_to_yield = detector.process_chunk(delta_content)
+                                    
+                                    if content_to_yield:
+                                        yield_chunk = {
+                                            "id": current_stream_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(os.path.getmtime(__file__)),
+                                            "model": model,
+                                            "choices": [{"index": 0, "delta": {"content": content_to_yield}}]
+                                        }
+                                        streamed_any_output = True
+                                        yield f"data: {json.dumps(yield_chunk)}\n\n".encode('utf-8')
+                                    
+                                    if is_detected:
+                                        # Tool call signal detected, switch to parsing mode
+                                        continue
+                                
+                                if finish_reason and pending_finish_reason is None:
+                                    # Defer finish until all buffered content is flushed.
+                                    pending_finish_reason = finish_reason
+                            
+                            except (json.JSONDecodeError, IndexError):
+                                # Ensure we always yield bytes to keep stream_with_token_count() stable
+                                streamed_any_output = True
+                                yield (line + "\n\n").encode("utf-8")
+                break
+            except Exception as exc:
+                if streamed_any_output or not _is_retriable_upstream_error(exc) or attempt >= UPSTREAM_RETRY_ATTEMPTS - 1:
+                    raise
+                delay = _get_upstream_retry_delay(attempt)
+                logger.warning(
+                    "⚠️ Upstream stream failed with %s before output; retrying in %.1fs (%s/%s)",
+                    type(exc).__name__,
+                    delay,
+                    attempt + 2,
+                    UPSTREAM_RETRY_ATTEMPTS,
+                )
+                await asyncio.sleep(delay)
+                detector = StreamingFunctionCallDetector(trigger_signal)
+                stream_id = None
+                pending_finish_reason = None
+                early_finalize_retry_attempted = False
+        else:
+            return
 
     except httpx.RequestError as e:
         logger.error(f"❌ Failed to connect to upstream service: {e}")
