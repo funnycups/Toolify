@@ -1358,10 +1358,11 @@ http_client = httpx.AsyncClient()
 
 UPSTREAM_RETRY_ATTEMPTS = 3
 UPSTREAM_RETRY_BASE_DELAY_SECONDS = 0.5
+EMPTY_RESPONSE_RETRY_ATTEMPTS = 1
 
 
 def _is_retriable_upstream_error(exc: Exception) -> bool:
-    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+    return isinstance(exc, (httpx.ConnectError, httpx.TimeoutException))
 
 
 def _get_upstream_retry_delay(attempt: int) -> float:
@@ -1392,6 +1393,69 @@ async def _post_upstream_with_retry(url: str, json_body: dict, headers: Dict[str
     if last_error is not None:
         raise last_error
     raise RuntimeError("Unreachable upstream retry state")
+
+
+def _get_choice_message_dict(choice: Dict[str, Any]) -> Dict[str, Any]:
+    message = choice.get("message", {})
+    return message if isinstance(message, dict) else {}
+
+
+def _get_first_message_dict(response_json: Dict[str, Any]) -> Dict[str, Any]:
+    choices = response_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return {}
+    return _get_choice_message_dict(choices[0]) if isinstance(choices[0], dict) else {}
+
+
+def _extract_response_text_for_token_count(response_json: Dict[str, Any]) -> str:
+    completion_text = ""
+    message = _get_first_message_dict(response_json)
+
+    content = message.get("content")
+    if content:
+        completion_text = content
+
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content:
+        completion_text = (completion_text + "\n" + reasoning_content).strip() if completion_text else reasoning_content
+
+    return completion_text
+
+
+def _choice_has_substantive_output(choice: Dict[str, Any]) -> bool:
+    message = _get_choice_message_dict(choice)
+    if not message:
+        return False
+
+    if message.get("tool_calls"):
+        return True
+
+    if message.get("reasoning_content"):
+        return True
+
+    content = message.get("content")
+    return isinstance(content, str) and bool(content.strip())
+
+
+def _is_empty_completion_response(response_json: Dict[str, Any], request_body: Dict[str, Any]) -> bool:
+    stop = request_body.get("stop")
+    if stop:
+        return False
+
+    choices = response_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+
+    if any(isinstance(choice, dict) and _choice_has_substantive_output(choice) for choice in choices):
+        return False
+
+    if any(not isinstance(choice, dict) or choice.get("finish_reason") != "stop" for choice in choices):
+        return False
+
+    usage = response_json.get("usage")
+    completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+
+    return completion_tokens == 0
 
 @app.middleware("http")
 async def debug_middleware(request: Request, call_next):
@@ -1687,30 +1751,41 @@ async def chat_completions(
             logger.debug(f"🔧 Sending upstream request to: {upstream_url}")
             logger.debug(f"🔧 has_function_call: {has_function_call}")
             logger.debug(f"🔧 Request body contains tools: {bool(body.tools)}")
-            
-            upstream_response = await _post_upstream_with_retry(
-                upstream_url, request_body_dict, headers, app_config.server.timeout
-            )
-            upstream_response.raise_for_status() # If status code is 4xx or 5xx, raise exception
-            
-            response_json = upstream_response.json()
+
+            response_json: Dict[str, Any]
+            for empty_attempt in range(EMPTY_RESPONSE_RETRY_ATTEMPTS + 1):
+                upstream_response = await _post_upstream_with_retry(
+                    upstream_url, request_body_dict, headers, app_config.server.timeout
+                )
+                upstream_response.raise_for_status() # If status code is 4xx or 5xx, raise exception
+
+                response_json = upstream_response.json()
+                if not _is_empty_completion_response(response_json, request_body_dict):
+                    break
+
+                if empty_attempt >= EMPTY_RESPONSE_RETRY_ATTEMPTS:
+                    logger.warning(
+                        "⚠️ Upstream returned empty completion response after retries; returning empty result to client. model=%s upstream=%s",
+                        actual_model,
+                        upstream["name"],
+                    )
+                    break
+                logger.warning(
+                    "⚠️ Upstream returned empty completion response; retrying request (%s/%s). model=%s upstream=%s",
+                    empty_attempt + 1,
+                    EMPTY_RESPONSE_RETRY_ATTEMPTS,
+                    actual_model,
+                    upstream["name"],
+                )
+
             logger.debug(f"🔧 Upstream response status code: {upstream_response.status_code}")
             
             # Count output tokens and handle usage
-            completion_text = ""
-            if response_json.get("choices") and len(response_json["choices"]) > 0:
-                message = response_json["choices"][0].get("message", {})
-                
-                # Extract content
-                content = message.get("content")
-                if content:
-                    completion_text = content
-                
-                # Check for reasoning_content
-                reasoning_content = message.get("reasoning_content")
-                if reasoning_content:
-                    completion_text = (completion_text + "\n" + reasoning_content).strip() if completion_text else reasoning_content
-                    logger.debug(f"🔧 Found reasoning_content, adding {len(reasoning_content)} chars to token count")
+            completion_text = _extract_response_text_for_token_count(response_json)
+            if completion_text:
+                message = _get_first_message_dict(response_json)
+                if message.get("reasoning_content"):
+                    logger.debug(f"🔧 Found reasoning_content, adding {len(message['reasoning_content'])} chars to token count")
             
             # Calculate our estimated tokens
             estimated_completion_tokens = token_counter.count_text_tokens(completion_text, body.model) if completion_text else 0
@@ -1979,6 +2054,13 @@ async def chat_completions(
                     "total_tokens": estimated_total_tokens
                 }
                 logger.debug(f"🔧 No upstream usage found, using estimates")
+
+            if done_received and not completion_text and final_usage.get("completion_tokens", 0) == 0:
+                logger.warning(
+                    "⚠️ Streaming upstream response completed with empty content. model=%s upstream=%s",
+                    body.model,
+                    upstream["name"],
+                )
             
             # Log token statistics
             logger.info("=" * 60)
