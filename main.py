@@ -457,6 +457,159 @@ def validate_parsed_tools(parsed_tools: List[Dict[str, Any]], tools: List["Tool"
     return None
 
 
+def _prompt_schema_type_name(schema: Any) -> str:
+    """Return a compact type label for prompt display."""
+    if not isinstance(schema, dict):
+        return "any"
+
+    stype = schema.get("type")
+    if isinstance(stype, str):
+        return stype
+    if isinstance(stype, list):
+        parts = [t for t in stype if isinstance(t, str)]
+        return " | ".join(parts) if parts else "any"
+
+    if any(k in schema for k in ("properties", "required", "additionalProperties")):
+        return "object"
+    if "items" in schema:
+        return "array"
+    if isinstance(schema.get("anyOf"), list):
+        return "anyOf"
+    if isinstance(schema.get("oneOf"), list):
+        return "oneOf"
+    if isinstance(schema.get("allOf"), list):
+        return "allOf"
+
+    return "any"
+
+
+def _prompt_schema_dump(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def _collect_prompt_schema_constraints(schema: Dict[str, Any]) -> Dict[str, Any]:
+    constraints: Dict[str, Any] = {}
+
+    for key in [
+        "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+        "minLength", "maxLength", "pattern", "format",
+        "minItems", "maxItems", "uniqueItems",
+        "minProperties", "maxProperties", "multipleOf"
+    ]:
+        if key in schema:
+            constraints[key] = schema.get(key)
+
+    if _prompt_schema_type_name(schema) == "array":
+        items = schema.get("items") or {}
+        if isinstance(items, dict):
+            item_type = _prompt_schema_type_name(items)
+            if item_type != "any":
+                constraints["items.type"] = item_type
+
+    return constraints
+
+
+def _append_prompt_schema_body(
+    lines: List[str],
+    schema: Any,
+    is_required: Optional[bool],
+    indent_level: int,
+    depth: int = 0
+) -> None:
+    schema_dict = schema if isinstance(schema, dict) else {}
+    indent = "  " * indent_level
+
+    if depth > 8:
+        lines.append(f"{indent}- note: nested schema omitted after depth 8")
+        return
+
+    lines.append(f"{indent}- type: {_prompt_schema_type_name(schema_dict)}")
+    if is_required is not None:
+        lines.append(f"{indent}- required: {'Yes' if is_required else 'No'}")
+
+    description = schema_dict.get("description")
+    if description:
+        lines.append(f"{indent}- description: {description}")
+
+    enum_vals = schema_dict.get("enum")
+    if enum_vals is not None:
+        lines.append(f"{indent}- enum: {_prompt_schema_dump(enum_vals)}")
+
+    if "const" in schema_dict:
+        lines.append(f"{indent}- const: {_prompt_schema_dump(schema_dict.get('const'))}")
+
+    default_val = schema_dict.get("default")
+    if default_val is not None:
+        lines.append(f"{indent}- default: {_prompt_schema_dump(default_val)}")
+
+    examples_val = schema_dict.get("examples") or schema_dict.get("example")
+    if examples_val is not None:
+        lines.append(f"{indent}- examples: {_prompt_schema_dump(examples_val)}")
+
+    constraints = _collect_prompt_schema_constraints(schema_dict)
+    if constraints:
+        lines.append(f"{indent}- constraints: {_prompt_schema_dump(constraints)}")
+
+    props_raw = schema_dict.get("properties")
+    props = props_raw if isinstance(props_raw, dict) else {}
+
+    required_raw = schema_dict.get("required")
+    required_list = required_raw if isinstance(required_raw, list) else []
+    required_list = [k for k in required_list if isinstance(k, str)]
+    if required_list:
+        lines.append(f"{indent}- required properties: {', '.join(required_list)}")
+
+    if props:
+        lines.append(f"{indent}- properties:")
+        for child_name, child_schema in props.items():
+            child_indent = "  " * (indent_level + 1)
+            child_name_text = str(child_name)
+            lines.append(f"{child_indent}- {child_name_text}:")
+            _append_prompt_schema_body(
+                lines,
+                child_schema,
+                child_name_text in required_list,
+                indent_level + 2,
+                depth + 1
+            )
+
+    items = schema_dict.get("items")
+    if isinstance(items, dict):
+        lines.append(f"{indent}- items:")
+        _append_prompt_schema_body(lines, items, None, indent_level + 1, depth + 1)
+    elif isinstance(items, list) and items:
+        lines.append(f"{indent}- items:")
+        for idx, item_schema in enumerate(items):
+            item_indent = "  " * (indent_level + 1)
+            lines.append(f"{item_indent}- item[{idx}]:")
+            _append_prompt_schema_body(lines, item_schema, None, indent_level + 2, depth + 1)
+
+    additional = schema_dict.get("additionalProperties", True)
+    if additional is False:
+        lines.append(f"{indent}- additionalProperties: false")
+    elif isinstance(additional, dict):
+        lines.append(f"{indent}- additionalProperties:")
+        _append_prompt_schema_body(lines, additional, None, indent_level + 1, depth + 1)
+
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        options = schema_dict.get(keyword)
+        if isinstance(options, list) and options:
+            lines.append(f"{indent}- {keyword}:")
+            for idx, option_schema in enumerate(options, start=1):
+                option_indent = "  " * (indent_level + 1)
+                lines.append(f"{option_indent}- option {idx}:")
+                _append_prompt_schema_body(
+                    lines,
+                    option_schema,
+                    None,
+                    indent_level + 2,
+                    depth + 1
+                )
+
+
 async def attempt_fc_parse_with_retry(
     content: str,
     trigger_signal: str,
@@ -842,64 +995,19 @@ def generate_function_prompt(tools: List[Tool], trigger_signal: str) -> tuple[st
 
         # Brief summary line: name (type)
         params_summary = ", ".join([
-            f"{p_name} ({(p_info or {}).get('type', 'any')})" for p_name, p_info in props.items()
+            f"{p_name} ({_prompt_schema_type_name(p_info)})" for p_name, p_info in props.items()
         ]) or "None"
 
         # Build detailed parameter spec for prompt injection (default enabled)
         detail_lines: List[str] = []
         for p_name, p_info in props.items():
-            p_info = p_info or {}
-            p_type = p_info.get("type", "any")
-            is_required = "Yes" if p_name in required_list else "No"
-            p_desc = p_info.get("description")
-            enum_vals = p_info.get("enum")
-            default_val = p_info.get("default")
-            examples_val = p_info.get("examples") or p_info.get("example")
-
-            # Common constraints and hints
-            constraints: Dict[str, Any] = {}
-            for key in [
-                "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
-                "minLength", "maxLength", "pattern", "format",
-                "minItems", "maxItems", "uniqueItems"
-            ]:
-                if key in p_info:
-                    constraints[key] = p_info.get(key)
-
-            # Array item type hint
-            if p_type == "array":
-                items = p_info.get("items") or {}
-                if isinstance(items, dict):
-                    itype = items.get("type")
-                    if itype:
-                        constraints["items.type"] = itype
-
-            # Compose pretty lines
             detail_lines.append(f"- {p_name}:")
-            detail_lines.append(f"  - type: {p_type}")
-            detail_lines.append(f"  - required: {is_required}")
-            if p_desc:
-                detail_lines.append(f"  - description: {p_desc}")
-            if enum_vals is not None:
-                try:
-                    detail_lines.append(f"  - enum: {json.dumps(enum_vals, ensure_ascii=False)}")
-                except Exception:
-                    detail_lines.append(f"  - enum: {enum_vals}")
-            if default_val is not None:
-                try:
-                    detail_lines.append(f"  - default: {json.dumps(default_val, ensure_ascii=False)}")
-                except Exception:
-                    detail_lines.append(f"  - default: {default_val}")
-            if examples_val is not None:
-                try:
-                    detail_lines.append(f"  - examples: {json.dumps(examples_val, ensure_ascii=False)}")
-                except Exception:
-                    detail_lines.append(f"  - examples: {examples_val}")
-            if constraints:
-                try:
-                    detail_lines.append(f"  - constraints: {json.dumps(constraints, ensure_ascii=False)}")
-                except Exception:
-                    detail_lines.append(f"  - constraints: {constraints}")
+            _append_prompt_schema_body(
+                detail_lines,
+                p_info,
+                p_name in required_list,
+                indent_level=1
+            )
 
         detail_block = "\n".join(detail_lines) if detail_lines else "(no parameter details)"
 
