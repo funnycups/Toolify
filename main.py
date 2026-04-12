@@ -1444,33 +1444,6 @@ async def _post_upstream_with_retry(url: str, json_body: dict, headers: Dict[str
         raise last_error
     raise RuntimeError("Unreachable upstream retry state")
 
-def _is_empty_completion_response(response_json: Dict[str, Any], request_body: Dict[str, Any]) -> bool:
-    """Detect upstream returning an empty completion (completion_tokens=0, no content, finish_reason=stop)."""
-    if request_body.get("stop"):
-        return False
-    choices = response_json.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return False
-    for choice in choices:
-        if not isinstance(choice, dict):
-            return False
-        message = choice.get("message", {})
-        if not isinstance(message, dict):
-            message = {}
-        # Has substantive output?
-        if message.get("tool_calls"):
-            return False
-        if message.get("reasoning_content"):
-            return False
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            return False
-        if choice.get("finish_reason") != "stop":
-            return False
-    usage = response_json.get("usage")
-    completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
-    return completion_tokens == 0
-
 @app.middleware("http")
 async def debug_middleware(request: Request, call_next):
     """Middleware for debugging validation errors, does not log conversation content."""
@@ -1766,26 +1739,11 @@ async def chat_completions(
             logger.debug(f"🔧 has_function_call: {has_function_call}")
             logger.debug(f"🔧 Request body contains tools: {bool(body.tools)}")
             
-            response_json: Dict[str, Any]
-            empty_retry_max = app_config.server.empty_response_retry
-            for empty_attempt in range(empty_retry_max + 1):
-                upstream_response = await _post_upstream_with_retry(
-                    upstream_url, request_body_dict, headers, app_config.server.timeout
-                )
-                upstream_response.raise_for_status()
-                response_json = upstream_response.json()
-                if not _is_empty_completion_response(response_json, request_body_dict):
-                    break
-                if empty_attempt >= empty_retry_max:
-                    logger.warning(
-                        "⚠️ Upstream returned empty completion response after retries; returning empty result to client. model=%s upstream=%s",
-                        actual_model, upstream["name"],
-                    )
-                    break
-                logger.warning(
-                    "⚠️ Upstream returned empty completion response; retrying request (%s/%s). model=%s upstream=%s",
-                    empty_attempt + 1, empty_retry_max, actual_model, upstream["name"],
-                )
+            upstream_response = await _post_upstream_with_retry(
+                upstream_url, request_body_dict, headers, app_config.server.timeout
+            )
+            upstream_response.raise_for_status()
+            response_json: Dict[str, Any] = upstream_response.json()
             logger.debug(f"🔧 Upstream response status code: {upstream_response.status_code}")
             
             # Count output tokens and handle usage
@@ -2278,7 +2236,9 @@ async def stream_proxy_with_fc_transform(
         chunks.append("data: [DONE]\n\n")
         return chunks
 
-    try:
+    max_attempts = _get_upstream_retry_attempts()
+    for attempt in range(max_attempts):
+      try:
         async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
             if response.status_code != 200:
                 error_content = await response.aread()
@@ -2413,15 +2373,28 @@ async def stream_proxy_with_fc_transform(
                         # Ensure we always yield bytes to keep stream_with_token_count() stable
                         yield (line + "\n\n").encode("utf-8")
 
-    except httpx.RequestError as e:
-        logger.error(f"❌ Failed to connect to upstream service: {e}")
-        logger.error(f"❌ Error type: {type(e).__name__}")
-        
-        error_message = "Failed to connect to upstream service"
-        error_chunk = {"error": {"message": error_message, "type": "connection_error"}}
-        yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
-        yield b"data: [DONE]\n\n"
-        return
+        # Stream completed successfully, break out of retry loop
+        break
+      except Exception as exc:
+        if not _is_retriable_upstream_error(exc) or attempt >= max_attempts - 1:
+            logger.error(f"❌ Failed to connect to upstream service: {exc}")
+            logger.error(f"❌ Error type: {type(exc).__name__}")
+            error_message = "Failed to connect to upstream service"
+            error_chunk = {"error": {"message": error_message, "type": "connection_error"}}
+            yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+            yield b"data: [DONE]\n\n"
+            return
+        delay = _get_upstream_retry_delay(attempt)
+        logger.warning(
+            "⚠️ Upstream stream (FC) failed with %s; retrying in %.1fs (%s/%s)",
+            type(exc).__name__, delay, attempt + 2, max_attempts,
+        )
+        await asyncio.sleep(delay)
+        # Reset detector state for retry
+        detector = StreamingFunctionCallDetector(trigger_signal)
+        stream_id = None
+        pending_finish_reason = None
+        continue
 
     if detector.state == "tool_parsing":
         logger.debug(f"🔧 Stream ended, starting to parse tool call XML...")
