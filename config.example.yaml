@@ -6,6 +6,9 @@ server:
   port: 8000                    # Server listening port
   host: "0.0.0.0"              # Server listening address
   timeout: 180                  # Request timeout (seconds)
+  upstream_retry_attempts: 3      # Max retries for connection errors/timeouts (0 to disable)
+  upstream_retry_base_delay: 0.5  # Base delay (seconds) for exponential backoff
+  empty_response_retry: 1         # Max retries for empty upstream responses (0 to disable)
 
 # Upstream OpenAI compatible service configuration
 upstream_services:

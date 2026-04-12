@@ -14,6 +14,9 @@ class ServerConfig(BaseModel):
     port: int = Field(default=8000, ge=1, le=65535, description="Server port")
     host: str = Field(default="0.0.0.0", description="Server host address")
     timeout: int = Field(default=180, ge=1, description="Request timeout (seconds)")
+    upstream_retry_attempts: int = Field(default=3, ge=0, le=10, description="Max retry attempts for upstream connection errors and timeouts (0 to disable)")
+    upstream_retry_base_delay: float = Field(default=0.5, ge=0.1, le=10.0, description="Base delay in seconds for exponential backoff between retries")
+    empty_response_retry: int = Field(default=1, ge=0, le=5, description="Max retry attempts when upstream returns empty completion response (0 to disable)")
 
 
 class UpstreamService(BaseModel):

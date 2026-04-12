@@ -7,6 +7,7 @@ import os
 import re
 import json
 import uuid
+import asyncio
 import httpx
 import secrets
 import string
@@ -1248,9 +1249,10 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
             return v
 
     def _parse_args_json_payload(payload: str) -> Optional[Dict[str, Any]]:
-        """Strict args_json parsing.
+        """Strict args_json parsing with markdown fence removal.
 
         - Empty payload -> {}
+        - Strips markdown code fences (```json ... ```) if present
         - Must be valid JSON and MUST decode to an object (dict)
         - Any invalid / non-object payload -> None (treated as parse failure)
         """
@@ -1259,6 +1261,10 @@ def parse_function_calls_xml(xml_string: str, trigger_signal: str) -> Optional[L
         s = payload.strip()
         if not s:
             return {}
+        # Remove accidental markdown fences if model emits them
+        if s.startswith("```"):
+            s = re.sub(r"^```(?:json)?\s*", "", s)
+            s = re.sub(r"\s*```$", "", s)
         try:
             parsed = json.loads(s)
         except Exception as e:
@@ -1402,6 +1408,64 @@ def find_upstream(model_name: str) -> tuple[Dict[str, Any], str]:
 
 app = FastAPI()
 http_client = httpx.AsyncClient()
+
+def _is_retriable_upstream_error(exc: Exception) -> bool:
+    return isinstance(exc, (httpx.ConnectError, httpx.TimeoutException))
+
+def _get_upstream_retry_delay(attempt: int) -> float:
+    return app_config.server.upstream_retry_base_delay * (2 ** attempt)
+
+async def _post_upstream_with_retry(url: str, json_body: dict, headers: Dict[str, str], timeout: int) -> httpx.Response:
+    """POST to upstream with automatic retry on connection errors and timeouts."""
+    max_attempts = app_config.server.upstream_retry_attempts
+    if max_attempts <= 0:
+        return await http_client.post(url, json=json_body, headers=headers, timeout=timeout)
+
+    last_error: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            return await http_client.post(url, json=json_body, headers=headers, timeout=timeout)
+        except Exception as exc:
+            last_error = exc
+            if not _is_retriable_upstream_error(exc) or attempt >= max_attempts - 1:
+                raise
+            delay = _get_upstream_retry_delay(attempt)
+            logger.warning(
+                "⚠️ Upstream POST failed with %s; retrying in %.1fs (%s/%s)",
+                type(exc).__name__, delay, attempt + 2, max_attempts,
+            )
+            await asyncio.sleep(delay)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Unreachable upstream retry state")
+
+def _is_empty_completion_response(response_json: Dict[str, Any], request_body: Dict[str, Any]) -> bool:
+    """Detect upstream returning an empty completion (completion_tokens=0, no content, finish_reason=stop)."""
+    if request_body.get("stop"):
+        return False
+    choices = response_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            return False
+        message = choice.get("message", {})
+        if not isinstance(message, dict):
+            message = {}
+        # Has substantive output?
+        if message.get("tool_calls"):
+            return False
+        if message.get("reasoning_content"):
+            return False
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return False
+        if choice.get("finish_reason") != "stop":
+            return False
+    usage = response_json.get("usage")
+    completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+    return completion_tokens == 0
 
 @app.middleware("http")
 async def debug_middleware(request: Request, call_next):
@@ -1698,12 +1762,26 @@ async def chat_completions(
             logger.debug(f"🔧 has_function_call: {has_function_call}")
             logger.debug(f"🔧 Request body contains tools: {bool(body.tools)}")
             
-            upstream_response = await http_client.post(
-                upstream_url, json=request_body_dict, headers=headers, timeout=app_config.server.timeout
-            )
-            upstream_response.raise_for_status() # If status code is 4xx or 5xx, raise exception
-            
-            response_json = upstream_response.json()
+            response_json: Dict[str, Any]
+            empty_retry_max = app_config.server.empty_response_retry
+            for empty_attempt in range(empty_retry_max + 1):
+                upstream_response = await _post_upstream_with_retry(
+                    upstream_url, request_body_dict, headers, app_config.server.timeout
+                )
+                upstream_response.raise_for_status()
+                response_json = upstream_response.json()
+                if not _is_empty_completion_response(response_json, request_body_dict):
+                    break
+                if empty_attempt >= empty_retry_max:
+                    logger.warning(
+                        "⚠️ Upstream returned empty completion response after retries; returning empty result to client. model=%s upstream=%s",
+                        actual_model, upstream["name"],
+                    )
+                    break
+                logger.warning(
+                    "⚠️ Upstream returned empty completion response; retrying request (%s/%s). model=%s upstream=%s",
+                    empty_attempt + 1, empty_retry_max, actual_model, upstream["name"],
+                )
             logger.debug(f"🔧 Upstream response status code: {upstream_response.status_code}")
             
             # Count output tokens and handle usage
@@ -2125,15 +2203,38 @@ async def stream_proxy_with_fc_transform(
     logger.info(f"📝 Function calling enabled: {has_fc}")
 
     if not has_fc or not trigger_signal:
-        try:
-            async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
-                async for chunk in response.aiter_bytes():
-                    yield chunk
-        except httpx.RemoteProtocolError:
-            logger.debug("🔧 Upstream closed connection prematurely, ending stream response")
-            return
+        max_attempts = app_config.server.upstream_retry_attempts or 1
+        streamed_any_output = False
+        for attempt in range(max_attempts):
+            try:
+                async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
+                    async for chunk in response.aiter_bytes():
+                        streamed_any_output = True
+                        yield chunk
+                return
+            except httpx.RemoteProtocolError:
+                logger.debug("🔧 Upstream closed connection prematurely, ending stream response")
+                return
+            except Exception as exc:
+                if streamed_any_output or not _is_retriable_upstream_error(exc) or attempt >= max_attempts - 1:
+                    raise
+                delay = _get_upstream_retry_delay(attempt)
+                logger.warning(
+                    "⚠️ Upstream stream failed with %s; retrying in %.1fs (%s/%s)",
+                    type(exc).__name__, delay, attempt + 2, max_attempts,
+                )
+                await asyncio.sleep(delay)
         return
     detector = StreamingFunctionCallDetector(trigger_signal)
+    stream_id = None
+    pending_finish_reason = None
+
+    def _ensure_stream_id(chunk_json: Optional[Dict[str, Any]] = None) -> str:
+        nonlocal stream_id
+        if stream_id is None:
+            upstream_id = chunk_json.get("id") if isinstance(chunk_json, dict) else None
+            stream_id = upstream_id or f"chatcmpl-passthrough-{uuid.uuid4().hex}"
+        return stream_id
 
     def _prepare_tool_calls(parsed_tools: List[Dict[str, Any]]):
         tool_calls = []
@@ -2156,17 +2257,17 @@ async def stream_proxy_with_fc_transform(
             }
             chunks.append(f"data: {json.dumps(metadata_chunk)}\n\n")
 
+        tc_id = stream_id or f"chatcmpl-{uuid.uuid4().hex}"
         initial_chunk = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
-            "created": int(os.path.getmtime(__file__)), "model": model_id,
+            "id": tc_id, "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": model_id,
             "choices": [{"index": 0, "delta": {"role": "assistant", "content": None, "tool_calls": tool_calls}, "finish_reason": None}],
         }
         chunks.append(f"data: {json.dumps(initial_chunk)}\n\n")
 
-
         final_chunk = {
-             "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
-            "created": int(os.path.getmtime(__file__)), "model": model_id,
+            "id": tc_id, "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": model_id,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
         }
         chunks.append(f"data: {json.dumps(final_chunk)}\n\n")
@@ -2248,9 +2349,9 @@ async def stream_proxy_with_fc_transform(
                                                 detector.content_buffer[:200],
                                             )
                                         stop_chunk = {
-                                            "id": f"chatcmpl-{uuid.uuid4().hex}",
+                                            "id": _ensure_stream_id(),
                                             "object": "chat.completion.chunk",
-                                            "created": int(os.path.getmtime(__file__)),
+                                            "created": int(time.time()),
                                             "model": model,
                                             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                                         }
@@ -2276,9 +2377,9 @@ async def stream_proxy_with_fc_transform(
                         # Forward reasoning_content directly (it's not part of function call detection)
                         if delta_reasoning:
                             reasoning_chunk = {
-                                "id": chunk_json.get("id") or f"chatcmpl-passthrough-{uuid.uuid4().hex}",
+                                "id": _ensure_stream_id(chunk_json),
                                 "object": "chat.completion.chunk",
-                                "created": chunk_json.get("created") or int(os.path.getmtime(__file__)),
+                                "created": int(time.time()),
                                 "model": model,
                                 "choices": [{"index": 0, "delta": {"reasoning_content": delta_reasoning}}]
                             }
@@ -2289,9 +2390,9 @@ async def stream_proxy_with_fc_transform(
                             
                             if content_to_yield:
                                 yield_chunk = {
-                                    "id": f"chatcmpl-passthrough-{uuid.uuid4().hex}",
+                                    "id": _ensure_stream_id(chunk_json),
                                     "object": "chat.completion.chunk",
-                                    "created": int(os.path.getmtime(__file__)),
+                                    "created": int(time.time()),
                                     "model": model,
                                     "choices": [{"index": 0, "delta": {"content": content_to_yield}}]
                                 }
@@ -2302,14 +2403,7 @@ async def stream_proxy_with_fc_transform(
                                 continue
                         
                         if finish_reason:
-                            finish_chunk = {
-                                "id": chunk_json.get("id") or f"chatcmpl-passthrough-{uuid.uuid4().hex}",
-                                "object": "chat.completion.chunk",
-                                "created": chunk_json.get("created") or int(os.path.getmtime(__file__)),
-                                "model": model,
-                                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
-                            }
-                            yield f"data: {json.dumps(finish_chunk)}\n\n".encode('utf-8')
+                            pending_finish_reason = finish_reason
                     
                     except (json.JSONDecodeError, IndexError):
                         # Ensure we always yield bytes to keep stream_with_token_count() stable
@@ -2369,9 +2463,9 @@ async def stream_proxy_with_fc_transform(
             
             if detector.content_buffer:
                 content_chunk = {
-                    "id": f"chatcmpl-fallback-{uuid.uuid4().hex}",
+                    "id": _ensure_stream_id(),
                     "object": "chat.completion.chunk",
-                    "created": int(os.path.getmtime(__file__)),
+                    "created": int(time.time()),
                     "model": model,
                     "choices": [{"index": 0, "delta": {"content": detector.content_buffer}}]
                 }
@@ -2380,18 +2474,18 @@ async def stream_proxy_with_fc_transform(
     elif detector.state == "detecting" and detector.content_buffer:
         # If stream has ended but buffer still has remaining characters insufficient to form signal, output them
         final_yield_chunk = {
-            "id": f"chatcmpl-finalflush-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
-            "created": int(os.path.getmtime(__file__)), "model": model,
+            "id": _ensure_stream_id(), "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": model,
             "choices": [{"index": 0, "delta": {"content": detector.content_buffer}}]
         }
         yield f"data: {json.dumps(final_yield_chunk)}\n\n".encode('utf-8')
     
     stop_chunk = {
-        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "id": _ensure_stream_id(),
         "object": "chat.completion.chunk",
-        "created": int(os.path.getmtime(__file__)),
+        "created": int(time.time()),
         "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        "choices": [{"index": 0, "delta": {}, "finish_reason": pending_finish_reason or "stop"}]
     }
     yield f"data: {json.dumps(stop_chunk)}\n\n".encode('utf-8')
     yield b"data: [DONE]\n\n"
