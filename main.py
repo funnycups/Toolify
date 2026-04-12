@@ -1412,12 +1412,16 @@ http_client = httpx.AsyncClient()
 def _is_retriable_upstream_error(exc: Exception) -> bool:
     return isinstance(exc, (httpx.ConnectError, httpx.TimeoutException))
 
+def _get_upstream_retry_attempts() -> int:
+    return getattr(app_config.server, "upstream_retry_attempts", 3) or 1
+
 def _get_upstream_retry_delay(attempt: int) -> float:
-    return app_config.server.upstream_retry_base_delay * (2 ** attempt)
+    base_delay = getattr(app_config.server, "upstream_retry_base_delay", 0.5)
+    return base_delay * (2 ** attempt)
 
 async def _post_upstream_with_retry(url: str, json_body: dict, headers: Dict[str, str], timeout: int) -> httpx.Response:
     """POST to upstream with automatic retry on connection errors and timeouts."""
-    max_attempts = app_config.server.upstream_retry_attempts
+    max_attempts = _get_upstream_retry_attempts()
     if max_attempts <= 0:
         return await http_client.post(url, json=json_body, headers=headers, timeout=timeout)
 
@@ -2203,7 +2207,7 @@ async def stream_proxy_with_fc_transform(
     logger.info(f"📝 Function calling enabled: {has_fc}")
 
     if not has_fc or not trigger_signal:
-        max_attempts = app_config.server.upstream_retry_attempts or 1
+        max_attempts = _get_upstream_retry_attempts()
         streamed_any_output = False
         for attempt in range(max_attempts):
             try:
