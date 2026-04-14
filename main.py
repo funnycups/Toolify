@@ -663,12 +663,22 @@ async def attempt_fc_parse_with_retry(
             logger.warning(f"⚠️ Function call parsing failed after {max_attempts} attempts")
             return None
         
-        # If parsing succeeded but tool/schema validation failed, report semantic errors.
+        # Classify the failure type to choose the right retry strategy
+        failure_type = _classify_fc_failure(current_content, trigger_signal)
+        if failure_type == "no_fc":
+            return None
+
         error_details = validation_error or _diagnose_fc_parse_error(current_content, trigger_signal)
-        retry_prompt = get_fc_error_retry_prompt(current_content, error_details)
-        
-        logger.info(f"🔄 Function call parsing failed, attempting retry {attempt + 2}/{max_attempts}")
-        logger.debug(f"🔧 Error details: {error_details}")
+
+        if failure_type == "truncated":
+            # Output was cut off — ask model to continue from where it stopped
+            retry_prompt = get_fc_continuation_prompt(current_content, error_details)
+            logger.info(f"🔄 Function call output truncated, requesting continuation {attempt + 2}/{max_attempts}")
+        else:
+            # Syntax error with closed tags — ask model to rewrite entirely
+            retry_prompt = get_fc_error_retry_prompt(current_content, error_details)
+            logger.info(f"🔄 Function call syntax error, requesting rewrite {attempt + 2}/{max_attempts}")
+        logger.debug(f"🔧 Failure type: {failure_type}, error details: {error_details}")
         
         retry_messages = current_messages + [
             {"role": "assistant", "content": current_content},
@@ -686,9 +696,18 @@ async def attempt_fc_parse_with_retry(
             retry_json = retry_response.json()
             
             if retry_json.get("choices") and len(retry_json["choices"]) > 0:
-                current_content = retry_json["choices"][0].get("message", {}).get("content", "")
+                retry_content = retry_json["choices"][0].get("message", {}).get("content", "")
+                logger.debug(f"🔧 Received retry response, length: {len(retry_content)}")
+
+                if failure_type == "truncated" and _is_continuation_response(retry_content, trigger_signal):
+                    # Model chose Option A: continuation — merge with truncated content
+                    current_content = _merge_truncated_and_continuation(current_content, retry_content)
+                    logger.info(f"🔧 Merged continuation, total length: {len(current_content)}")
+                else:
+                    # Model chose Option B (full rewrite) or it was a syntax_error retry
+                    current_content = retry_content
+
                 current_messages = retry_messages
-                logger.debug(f"🔧 Received retry response, length: {len(current_content)}")
             else:
                 logger.warning(f"⚠️ Retry response has no valid choices")
                 return None
@@ -747,6 +766,84 @@ def _diagnose_fc_parse_error(content: str, trigger_signal: str) -> str:
         errors.append("XML structure appears correct but parsing failed for unknown reason")
     
     return "; ".join(errors)
+
+
+def _classify_fc_failure(content: str, trigger_signal: str) -> str:
+    """Classify function call failure type.
+
+    Returns:
+        'no_fc' - no trigger signal found outside think blocks
+        'truncated' - trigger signal and opening tag found but no closing tag (output was cut off)
+        'syntax_error' - tags are closed but content is malformed
+    """
+    if find_last_trigger_signal_outside_think(content, trigger_signal) == -1:
+        return "no_fc"
+
+    cleaned = remove_think_blocks(content)
+    pos = find_last_trigger_signal_outside_think(cleaned, trigger_signal)
+    if pos == -1:
+        return "no_fc"
+
+    after_trigger = cleaned[pos:]
+    has_open = "<" + "function_calls>" in after_trigger
+    has_close = "</" + "function_calls>" in after_trigger
+
+    if not has_open:
+        return "syntax_error"
+    if has_open and not has_close:
+        return "truncated"
+    return "syntax_error"
+
+
+def get_fc_continuation_prompt(truncated_content: str, error_details: str) -> str:
+    """Generate a prompt asking the model to continue its truncated function call output."""
+    # Show only the tail to save tokens
+    tail = truncated_content[-1500:]
+    fci_close = "</" + "function_call>"
+    fc_close = "</" + "function_calls>"
+    return (
+        "Your previous response was cut off before the function call XML was complete.\n"
+        "\n"
+        "**Your truncated response (ending abruptly):**\n"
+        "```\n"
+        f"{tail}\n"
+        "```\n"
+        "\n"
+        f"**What happened:** {error_details}\n"
+        "\n"
+        "**You have two options:**\n"
+        "\n"
+        "**Option A (PREFERRED \u2014 Continue writing):**\n"
+        "Output ONLY the exact continuation from where you were cut off. Rules:\n"
+        "- Start EXACTLY from the next character after the cutoff point \u2014 do not repeat ANY text, not even a single character\n"
+        "- If the cutoff happened mid-word, start from the next character of that word, never repeat the partial character/word\n"
+        "- Do NOT output any trigger signal or opening tags that were already present\n"
+        f"- End with the proper closing tags ({fci_close}, {fc_close} as needed)\n"
+        "- Do NOT add any explanation before or after\n"
+        "\n"
+        "**Option B (Only if you made an error earlier):**\n"
+        "Start fresh with the complete function call from the trigger signal. "
+        "Output the trigger signal on its own line, followed by the complete "
+        "function_calls block.\n"
+        "\n"
+        "Choose Option A unless you believe your previous output contained errors that need correction."
+    )
+
+
+def _is_continuation_response(retry_content: str, trigger_signal: str) -> bool:
+    """Determine if the model's retry response is a continuation or a full rewrite."""
+    cleaned = retry_content.strip()
+    if trigger_signal in cleaned:
+        return False
+    fc_open = "<" + "function_calls>"
+    if cleaned.lstrip().startswith(fc_open):
+        return False
+    return True
+
+
+def _merge_truncated_and_continuation(truncated: str, continuation: str) -> str:
+    """Merge truncated content with its continuation."""
+    return truncated.rstrip("\n") + continuation.lstrip("\n")
 
 
 def format_tool_result_for_ai(tool_name: str, tool_arguments: str, result_content: str) -> str:
@@ -2109,11 +2206,20 @@ async def _attempt_streaming_fc_retry(
             logger.warning(f"⚠️ Streaming FC retry failed after {max_attempts} attempts")
             return None
         
-        # If parsing succeeded but tool/schema validation failed, report semantic errors.
+        # Classify the failure type to choose the right retry strategy
+        failure_type = _classify_fc_failure(current_content, trigger_signal)
+        if failure_type == "no_fc":
+            return None
+
         error_details = validation_error or _diagnose_fc_parse_error(current_content, trigger_signal)
-        retry_prompt = get_fc_error_retry_prompt(current_content, error_details)
-        
-        logger.info(f"🔄 Streaming FC retry attempt {attempt + 2}/{max_attempts}")
+
+        if failure_type == "truncated":
+            retry_prompt = get_fc_continuation_prompt(current_content, error_details)
+            logger.info(f"🔄 Streaming FC output truncated, requesting continuation {attempt + 2}/{max_attempts}")
+        else:
+            retry_prompt = get_fc_error_retry_prompt(current_content, error_details)
+            logger.info(f"🔄 Streaming FC syntax error, requesting rewrite {attempt + 2}/{max_attempts}")
+        logger.debug(f"🔧 Failure type: {failure_type}, error details: {error_details}")
         
         retry_messages = current_messages + [
             {"role": "assistant", "content": current_content},
@@ -2131,7 +2237,14 @@ async def _attempt_streaming_fc_retry(
             retry_json = retry_response.json()
             
             if retry_json.get("choices") and len(retry_json["choices"]) > 0:
-                current_content = retry_json["choices"][0].get("message", {}).get("content", "")
+                retry_content = retry_json["choices"][0].get("message", {}).get("content", "")
+
+                if failure_type == "truncated" and _is_continuation_response(retry_content, trigger_signal):
+                    current_content = _merge_truncated_and_continuation(current_content, retry_content)
+                    logger.info(f"🔧 Streaming: merged continuation, total length: {len(current_content)}")
+                else:
+                    current_content = retry_content
+
                 current_messages = retry_messages
                 
                 parsed_tools, validation_error = _parse_and_validate(current_content)
